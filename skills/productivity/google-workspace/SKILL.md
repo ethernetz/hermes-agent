@@ -116,19 +116,16 @@ explicit (for example `~/Downloads/hermes-google-client-secret.json`), then run
 
 ### Step 3: Get authorization URL
 
-Use the service set chosen in Step 1. Examples:
+Generate the auth URL:
 
 ```bash
-$GSETUP --auth-url --services email,calendar --format json
-$GSETUP --auth-url --services calendar,drive,sheets,docs --format json
-$GSETUP --auth-url --services all --format json
+$GSETUP --auth-url
 ```
 
-This returns JSON with an `auth_url` field and also saves the exact URL to
-`~/.hermes/google_oauth_last_url.txt`.
+This prints the OAuth URL directly.
 
 Agent rules for this step:
-- Extract the `auth_url` field and send that exact URL to the user as a single line.
+- Send that exact URL to the user as a single line.
 - Tell the user that the browser will likely fail on `http://localhost:1` after approval, and that this is expected.
 - Tell them to copy the ENTIRE redirected URL from the browser address bar.
 - If the user gets `Error 403: access_denied`, send them directly to `https://console.cloud.google.com/auth/audience` to add themselves as a test user.
@@ -159,10 +156,12 @@ Should print `AUTHENTICATED`. Setup is complete — token refreshes automaticall
 
 ### Notes
 
-- Token is stored at `~/.hermes/google_token.json` and auto-refreshes.
-- Pending OAuth session state/verifier are stored temporarily at `~/.hermes/google_oauth_pending.json` until exchange completes.
-- If `gws` is installed, `google_api.py` points it at the same `~/.hermes/google_token.json` credentials file. Users do not need to run a separate `gws auth login` flow.
-- To revoke: `$GSETUP --revoke`
+- Default token is stored at `~/.hermes/google_token.json` and auto-refreshes.
+- Named accounts are supported with `--account NAME` on both `setup.py` and `google_api.py`. Names may contain only letters, numbers, underscores, and hyphens. Example: `--account spam` stores `~/.hermes/google_spam_token.json`, `~/.hermes/google_spam_client_secret.json`, and `~/.hermes/google_spam_oauth_pending.json`.
+- Use `--account primary`, `--account default`, or omit `--account` for the legacy default paths.
+- Pending OAuth session state/verifier are stored temporarily at `~/.hermes/google_oauth_pending.json` for the default account, or the matching named-account pending file, until exchange completes.
+- If `gws` is installed, `google_api.py` points it at the selected account token credentials file. Users do not need to run a separate `gws auth login` flow.
+- To revoke: `$GSETUP --revoke` or `$GSETUP --account NAME --revoke`
 
 ## Usage
 

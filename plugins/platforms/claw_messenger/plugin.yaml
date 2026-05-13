@@ -1,0 +1,9 @@
+name: claw-messenger-platform
+kind: platform
+version: 0.1.0
+description: >
+  Hermes gateway adapter for the Claw Messenger websocket relay used by
+  OpenClaw's claw-messenger channel.
+author: Ethan Netz / Codex
+requires_env:
+  - CLAW_MESSENGER_API_KEY

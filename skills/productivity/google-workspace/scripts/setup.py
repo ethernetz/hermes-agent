@@ -26,6 +26,7 @@ from __future__ import annotations  # allow PEP 604 `X | None` on Python 3.9+
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,33 @@ HERMES_HOME = get_hermes_home()
 TOKEN_PATH = HERMES_HOME / "google_token.json"
 CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
 PENDING_AUTH_PATH = HERMES_HOME / "google_oauth_pending.json"
+
+_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_DEFAULT_ACCOUNTS = {"", "default", "primary"}
+
+
+def _account_paths(account: str | None = None) -> tuple[Path, Path, Path]:
+    """Return token/client-secret/pending paths for a Google account alias."""
+    account = (account or "").strip()
+    if account in _DEFAULT_ACCOUNTS:
+        return (
+            HERMES_HOME / "google_token.json",
+            HERMES_HOME / "google_client_secret.json",
+            HERMES_HOME / "google_oauth_pending.json",
+        )
+    if not _ACCOUNT_RE.fullmatch(account):
+        raise ValueError("Account name must contain only letters, numbers, underscores, or hyphens")
+    return (
+        HERMES_HOME / f"google_{account}_token.json",
+        HERMES_HOME / f"google_{account}_client_secret.json",
+        HERMES_HOME / f"google_{account}_oauth_pending.json",
+    )
+
+
+def set_account(account: str | None = None) -> None:
+    """Select which account alias subsequent setup operations use."""
+    global TOKEN_PATH, CLIENT_SECRET_PATH, PENDING_AUTH_PATH
+    TOKEN_PATH, CLIENT_SECRET_PATH, PENDING_AUTH_PATH = _account_paths(account)
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -459,7 +487,13 @@ def main():
     group.add_argument("--auth-code", metavar="CODE", help="Exchange auth code for token")
     group.add_argument("--revoke", action="store_true", help="Revoke and delete stored token")
     group.add_argument("--install-deps", action="store_true", help="Install Python dependencies")
+    parser.add_argument("--account", default="", help="Google account alias. Omit or use primary/default for legacy paths; named accounts use google_<account>_*.json")
     args = parser.parse_args()
+
+    try:
+        set_account(args.account)
+    except ValueError as e:
+        parser.error(str(e))
 
     if args.check:
         sys.exit(0 if check_auth() else 1)
