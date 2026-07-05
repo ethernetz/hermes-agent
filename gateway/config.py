@@ -294,6 +294,11 @@ class SessionResetPolicy:
     # by the reset guard. Raise this if you run legitimate multi-day jobs whose
     # liveness should pin the conversation open.
     bg_process_max_age_hours: int = 24
+    # How many tail messages from the expired conversation are recapped into
+    # the first turn of the replacement session on idle/daily auto-reset,
+    # so the agent keeps continuity instead of starting with amnesia.
+    # 0 disables carryover (legacy behavior).
+    carryover_messages: int = 12
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -303,8 +308,9 @@ class SessionResetPolicy:
             "notify": self.notify,
             "notify_exclude_platforms": list(self.notify_exclude_platforms),
             "bg_process_max_age_hours": self.bg_process_max_age_hours,
+            "carryover_messages": self.carryover_messages,
         }
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionResetPolicy":
         # Handle both missing keys and explicit null values (YAML null → None)
@@ -314,6 +320,11 @@ class SessionResetPolicy:
         notify = data.get("notify")
         exclude = data.get("notify_exclude_platforms")
         bg_max_age = data.get("bg_process_max_age_hours")
+        carryover = data.get("carryover_messages")
+        try:
+            carryover = int(carryover) if carryover is not None else 12
+        except (TypeError, ValueError):
+            carryover = 12
         return cls(
             mode=mode if mode is not None else "both",
             at_hour=at_hour if at_hour is not None else 4,
@@ -321,6 +332,7 @@ class SessionResetPolicy:
             notify=_coerce_bool(notify, True),
             notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
             bg_process_max_age_hours=bg_max_age if bg_max_age is not None else 24,
+            carryover_messages=max(0, carryover),
         )
 
 

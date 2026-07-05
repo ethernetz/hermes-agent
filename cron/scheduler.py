@@ -1870,6 +1870,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 thread_id=thread_id, user_id=origin_user_id,
                 enabled=mirror_this_target and not thread_seeded,
             )
+            # Record the delivery in the target chat's session transcript so
+            # the gateway agent remembers what this job just told the user
+            # (no-op when the gateway isn't running — see outbound_memory).
+            # Skip when the origin-chat mirror above already covered it, so a
+            # single delivery never lands in the transcript twice.
+            if not (mirror_this_target and not thread_seeded):
+                from gateway.outbound_memory import record_outbound
+                record_outbound(
+                    platform_name,
+                    chat_id,
+                    cleaned_delivery_content.strip(),
+                    origin=f"cron job '{job.get('name') or job['id']}'",
+                    thread_id=thread_id,
+                )
 
     if delivery_errors:
         return "; ".join(delivery_errors)

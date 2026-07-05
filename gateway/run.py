@@ -2796,6 +2796,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
         )
         self.delivery_router = DeliveryRouter(self.config)
+
+        # Register the out-of-band delivery recorder so cron jobs and
+        # webhook direct-deliveries land in the target chat's session
+        # transcript — without this the agent has amnesia about messages
+        # the user received "from it" outside a conversation turn.
+        from gateway.outbound_memory import set_outbound_recorder
+        set_outbound_recorder(self._record_outbound_delivery)
+
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
@@ -10440,6 +10448,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    def _record_outbound_delivery(
+        self,
+        platform_name: str,
+        chat_id: str,
+        text: str,
+        origin: str,
+        thread_id: Optional[str] = None,
+    ) -> None:
+        """Append an out-of-band delivery to the target chat's session.
+
+        Called (via gateway.outbound_memory) by the cron scheduler and
+        webhook direct-deliver paths after a successful send, from any
+        thread. Best-effort by contract: raising here is caught and logged
+        by record_outbound().
+        """
+        try:
+            platform = Platform(platform_name.lower())
+        except (ValueError, KeyError):
+            logger.debug("outbound-memory: unknown platform %r", platform_name)
+            return
+
+        # Prefer the origin of an existing session for this chat so the
+        # record lands in exactly the session the user's replies will hit
+        # (chat_type and per-user isolation affect the session key).
+        source = self.session_store.find_source_for_chat(
+            platform, str(chat_id), thread_id=thread_id,
+        )
+        if source is None:
+            source = SessionSource(
+                platform=platform,
+                chat_id=str(chat_id),
+                chat_name=str(chat_id),
+                chat_type="dm",
+                user_id=str(chat_id),
+                user_name=str(chat_id),
+                thread_id=str(thread_id) if thread_id else None,
+            )
+
+        from gateway.outbound_memory import format_outbound_record
+        entry = self.session_store.get_or_create_session(source)
+        self.session_store.append_to_transcript(
+            entry.session_id,
+            {
+                "role": "assistant",
+                "content": format_outbound_record(text, origin),
+                "timestamp": datetime.now().isoformat(),
+            },
+        )
+        logger.info(
+            "outbound-memory: recorded %s delivery to %s:%s in session %s",
+            origin, platform_name, chat_id, entry.session_id,
+        )
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -10599,12 +10660,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if _was_auto_reset:
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
+
+            # For idle/daily resets, carry a recap of the expired
+            # conversation's tail into the new session so the agent keeps
+            # continuity — a reset must not mean amnesia about what was just
+            # said (or delivered out-of-band) in this chat. Suspended
+            # sessions stay a deliberate clean wipe.
+            carryover_recap = None
+            if reset_reason in ("idle", "daily"):
+                try:
+                    _co_policy = self.session_store.config.get_reset_policy(
+                        platform=source.platform,
+                        session_type=getattr(source, 'chat_type', 'dm'),
+                    )
+                    _co_limit = getattr(_co_policy, "carryover_messages", 12)
+                    _prev_id = getattr(session_entry, "prev_session_id", None)
+                    if _co_limit > 0 and _prev_id:
+                        carryover_recap = self.session_store.build_carryover_recap(
+                            _prev_id, max_messages=_co_limit,
+                        )
+                except Exception as e:
+                    logger.debug("Carryover recap failed (non-fatal): %s", e)
+
             if reset_reason == "suspended":
                 context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
             elif reset_reason == "daily":
-                context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
+                context_note = "[System note: The user's session was automatically reset by the daily schedule.]"
             else:
-                context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
+                context_note = "[System note: The user's previous session expired due to inactivity.]"
+
+            if carryover_recap:
+                context_note += (
+                    "\n[Recap of the end of your previous conversation in this "
+                    "chat — treat it as context you remember, not as new "
+                    "messages. The user may be replying to any of it:]\n"
+                    f"{carryover_recap}\n[End of recap.]"
+                )
+            elif reset_reason != "suspended":
+                context_note += " [This is a fresh conversation with no prior context.]"
             context_prompt = context_note + "\n\n" + context_prompt
 
             # Send a user-facing notification explaining the reset, unless:
@@ -10637,9 +10730,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             mins = policy.idle_minutes % 60
                             duration = f"{hours}h" if not mins else f"{hours}h {mins}m" if hours else f"{mins}m"
                             reason_text = f"inactive for {duration}"
+                        history_line = (
+                            "Conversation history cleared; I've kept a recap of our last exchange.\n"
+                            if carryover_recap
+                            else "Conversation history cleared.\n"
+                        )
                         notice = (
                             f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
+                            f"{history_line}"
                             f"Use /resume to browse and restore a previous session.\n"
                             f"Adjust reset timing in config.yaml under session_reset."
                         )

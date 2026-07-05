@@ -1212,4 +1212,16 @@ class WebhookAdapter(BasePlatformAdapter):
         if thread_id:
             metadata = {"thread_id": thread_id}
 
-        return await adapter.send(chat_id, content, metadata=metadata)
+        result = await adapter.send(chat_id, content, metadata=metadata)
+        if result and result.success:
+            # Record the delivery in the target chat's session transcript so
+            # the gateway agent remembers what was pushed to the user.
+            from gateway.outbound_memory import record_outbound
+            record_outbound(
+                platform_name,
+                chat_id,
+                content,
+                origin="a webhook direct-delivery",
+                thread_id=thread_id,
+            )
+        return result

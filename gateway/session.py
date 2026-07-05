@@ -637,6 +637,12 @@ class SessionEntry:
     auto_reset_reason: Optional[str] = None  # "idle" or "daily"
     reset_had_activity: bool = False  # whether the expired session had any messages
 
+    # Session id of the conversation this entry auto-reset from (idle/daily
+    # only — never for suspended or manual /reset, which are deliberate
+    # wipes).  Lets the first turn of the new session carry over a recap of
+    # the previous conversation's tail instead of starting with amnesia.
+    prev_session_id: Optional[str] = None
+
     # Set by reset_session() when the user explicitly sends /new or /reset.
     # Consumed once by _handle_message_with_agent to trigger topic/channel
     # skill re-injection on the first message of the new session.  We can't
@@ -708,6 +714,7 @@ class SessionEntry:
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
+            "prev_session_id": self.prev_session_id,
         }
         if self.model_override:
             # Defence-in-depth: strip credentials even if a caller stored an
@@ -775,6 +782,7 @@ class SessionEntry:
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
             model_override=sanitize_model_override(data.get("model_override")),
+            prev_session_id=data.get("prev_session_id"),
         )
 
 
@@ -1643,6 +1651,14 @@ class SessionStore:
                 was_auto_reset=was_auto_reset,
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
+                # Carry a pointer to the expired conversation for idle/daily
+                # resets so the first turn can recap it. Suspended sessions
+                # are deliberate wipes — no carryover.
+                prev_session_id=(
+                    db_end_session_id
+                    if auto_reset_reason in ("idle", "daily")
+                    else None
+                ),
             )
 
             self._entries[session_key] = entry
@@ -2105,6 +2121,94 @@ class SessionStore:
         except Exception:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
+
+    def find_source_for_chat(
+        self,
+        platform: Platform,
+        chat_id: str,
+        thread_id: Optional[str] = None,
+    ) -> Optional[SessionSource]:
+        """Find the SessionSource of the most recent session for a chat.
+
+        Used by the out-of-band delivery recorder: a cron/webhook delivery
+        only knows ``platform:chat_id``, but session keys also depend on
+        chat_type (dm vs group) and per-user isolation. Reusing the origin
+        of an existing entry guarantees the recorded message lands in the
+        same session the user's replies will hit.
+        """
+        chat_id = str(chat_id)
+        best: Optional[SessionEntry] = None
+        with self._lock:
+            self._ensure_loaded_locked()
+            for entry in self._entries.values():
+                origin = entry.origin
+                if origin is None or origin.platform != platform:
+                    continue
+                if str(origin.chat_id or "") != chat_id:
+                    continue
+                if thread_id and str(origin.thread_id or "") != str(thread_id):
+                    continue
+                if best is None or entry.updated_at > best.updated_at:
+                    best = entry
+        return best.origin if best else None
+
+    def build_carryover_recap(
+        self,
+        prev_session_id: str,
+        max_messages: int = 12,
+        max_chars: int = 4000,
+        per_message_chars: int = 600,
+    ) -> Optional[str]:
+        """Render the tail of an expired session's conversation as a recap.
+
+        Returns a compact "User: ... / You: ..." text block for the first
+        turn of the replacement session, or None when the previous
+        transcript has nothing usable. Only plain user/assistant text
+        survives — tool calls, tool results, and system/meta rows are
+        skipped.
+        """
+        if not prev_session_id or max_messages <= 0:
+            return None
+        try:
+            history = self.load_transcript(prev_session_id)
+        except Exception as e:
+            logger.debug("Carryover recap: failed to load %s: %s", prev_session_id, e)
+            return None
+        if not history:
+            return None
+
+        lines: List[str] = []
+        for msg in history:
+            role = msg.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                # Multimodal content: keep the text parts
+                content = " ".join(
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+            if not isinstance(content, str) or not content.strip():
+                continue
+            text = content.strip()
+            if len(text) > per_message_chars:
+                text = text[: per_message_chars - 1].rstrip() + "…"
+            speaker = "User" if role == "user" else "You"
+            lines.append(f"{speaker}: {text}")
+
+        if not lines:
+            return None
+        lines = lines[-max_messages:]
+        recap = "\n".join(lines)
+        if len(recap) > max_chars:
+            recap = recap[-max_chars:]
+            # Avoid starting mid-line after the hard cut
+            cut = recap.find("\n")
+            if 0 <= cut < len(recap) - 1:
+                recap = recap[cut + 1:]
+        return recap
 
     def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> bool:
         """Replace the entire transcript for a session with new messages.
