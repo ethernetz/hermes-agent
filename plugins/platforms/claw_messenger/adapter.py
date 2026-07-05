@@ -120,6 +120,22 @@ def _is_direct_phone(chat_id: str) -> bool:
     return bool(PHONE_RE.match(_normalize_target(chat_id)))
 
 
+# Silence tokens: when the agent's ENTIRE response is one of these, the turn
+# is intentionally silent (visible content was already delivered via the
+# message tool or an out-of-band webhook). This fork's gateway has no shared
+# silence filter (upstream added gateway/response_filters.py in 293c04fef,
+# post-fork), so suppression lives here at the adapter boundary. The token is
+# still recorded in session history so the model sees its own convention.
+_SILENCE_TOKENS = {"[silent]", "no_reply"}
+
+
+def _is_silence_token(text: str) -> bool:
+    value = str(text or "").strip()
+    # Tolerate model quirks: enclosing quotes/backticks and a trailing period.
+    value = value.strip("`\"'").rstrip(".").strip()
+    return value.lower() in _SILENCE_TOKENS
+
+
 def _looks_like_image(value: str) -> bool:
     lower = str(value or "").lower().split("?", 1)[0]
     return lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".heif"))
@@ -248,6 +264,13 @@ class ClawMessengerAdapter(BasePlatformAdapter):
     ) -> SendResult:
         text = str(content or "")
         if not text.strip():
+            return SendResult(success=True, message_id="")
+
+        if _is_silence_token(text):
+            logger.info(
+                "[claw_messenger] Suppressing silence token %r for %s",
+                text.strip(), chat_id,
+            )
             return SendResult(success=True, message_id="")
 
         target = _normalize_target(chat_id)
