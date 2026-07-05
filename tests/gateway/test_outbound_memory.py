@@ -35,7 +35,16 @@ def store(tmp_path):
     config = GatewayConfig()
     with patch("gateway.session.SessionStore._ensure_loaded"):
         s = SessionStore(sessions_dir=tmp_path, config=config)
-    s._db = None  # JSONL-only for these tests
+    # Upstream spec 002 removed the legacy JSONL transcript fallback; a real
+    # (temp) SQLite SessionDB is now required for transcript reads, and
+    # messages have a FK on sessions — register ids before appending.
+    from hermes_state import SessionDB
+    s._db = SessionDB(db_path=tmp_path / "state.db")
+    _orig_append = s.append_to_transcript
+    def _append(session_id, message, skip_db=False):
+        s._db.ensure_session(session_id, source="gateway")
+        _orig_append(session_id, message, skip_db=skip_db)
+    s.append_to_transcript = _append
     s._loaded = True
     return s
 
