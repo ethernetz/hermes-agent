@@ -4860,6 +4860,30 @@ class SessionDB:
             )
             return cursor.fetchone() is not None
 
+    def set_message_platform_id(
+        self, message_id: int, platform_message_id: str
+    ) -> bool:
+        """Stamp an existing message row with its platform-side message id.
+
+        Used by the outbound write-ahead recorder: an out-of-band delivery is
+        appended to the transcript BEFORE the platform send, then stamped with
+        the adapter's returned message id once delivery is confirmed — so an
+        inbound swipe-reply carrying that platform id can be resolved back to
+        the exact recorded turn it answers. Content is untouched (no FTS
+        impact). Returns True if a row was updated.
+        """
+        if not message_id or not (platform_message_id or "").strip():
+            return False
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET platform_message_id = ? WHERE id = ?",
+                (str(platform_message_id), int(message_id)),
+            )
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
     # =========================================================================
     # Export and cleanup
     # =========================================================================

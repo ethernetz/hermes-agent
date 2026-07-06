@@ -22,10 +22,14 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, SessionResetPolicy
 from gateway.outbound_memory import (
+    DELIVERY_FAILED_PREFIX,
     OUT_OF_BAND_PREFIX,
+    begin_outbound_record,
+    finish_outbound_record,
     format_outbound_record,
     record_outbound,
     set_outbound_recorder,
+    set_outbound_writeahead_recorder,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
 
@@ -51,10 +55,35 @@ def store(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _clean_recorder():
-    """Recorder is process-global state — never leak it between tests."""
+    """Recorders are process-global state — never leak them between tests."""
     set_outbound_recorder(None)
+    set_outbound_writeahead_recorder(None)
     yield
     set_outbound_recorder(None)
+    set_outbound_writeahead_recorder(None)
+
+
+class _FakeWriteaheadRecorder:
+    """Capture-everything write-ahead recorder for ordering assertions."""
+
+    def __init__(self, events=None):
+        self.events = events if events is not None else []
+        self.handles = []
+
+    def begin(self, platform_name, chat_id, text, origin, thread_id):
+        handle = {
+            "platform": platform_name, "chat_id": chat_id,
+            "text": text, "origin": origin, "thread_id": thread_id,
+        }
+        self.handles.append(handle)
+        self.events.append(("begin", text))
+        return handle
+
+    def mark_delivered(self, handle, platform_message_id):
+        self.events.append(("delivered", platform_message_id))
+
+    def mark_failed(self, handle, error):
+        self.events.append(("failed", error))
 
 
 def _dm_source(chat_id="12345", platform=Platform.TELEGRAM, **kwargs):
@@ -142,6 +171,11 @@ class TestRecordedDeliveryVisibleToReply:
 
         runner = MagicMock()
         runner.session_store = store
+        runner._resolve_outbound_session_entry = (
+            lambda p, c, t=None: GatewayRunner._resolve_outbound_session_entry(
+                runner, p, c, t
+            )
+        )
         GatewayRunner._record_outbound_delivery(
             runner, platform_name, chat_id, text, origin, thread_id
         )
@@ -280,6 +314,40 @@ class TestBuildCarryoverRecap:
             store.append_to_transcript(sid, {"role": "user", "content": f"msg {i}"})
         recap = store.build_carryover_recap(sid, max_messages=3)
         assert recap == "User: msg 17\nUser: msg 18\nUser: msg 19"
+
+    def test_recap_keeps_unanswered_out_of_band_tail_beyond_cap(self, store):
+        """An alert the user hasn't answered must never fall out of the recap.
+
+        A burst of deliveries after the user's last message can exceed
+        max_messages; all out-of-band turns newer than the last user turn
+        are kept regardless of the cap.
+        """
+        sid = "prev_oob_tail"
+        store.append_to_transcript(sid, {"role": "user", "content": "hi"})
+        store.append_to_transcript(sid, {"role": "assistant", "content": "hey"})
+        for i in range(8):
+            store.append_to_transcript(sid, {
+                "role": "assistant",
+                "content": format_outbound_record(f"alert {i}", "cron job 'a'"),
+            })
+        recap = store.build_carryover_recap(sid, max_messages=3, max_chars=100000)
+        # All 8 alerts survive even though the cap is 3.
+        for i in range(8):
+            assert f"alert {i}" in recap
+        # The pre-burst small talk is beyond both the cap and the OOB rule.
+        assert "User: hi" not in recap
+
+    def test_recap_oob_before_last_user_message_not_exempt(self, store):
+        sid = "prev_oob_answered"
+        store.append_to_transcript(sid, {
+            "role": "assistant",
+            "content": format_outbound_record("old alert", "cron job 'a'"),
+        })
+        for i in range(6):
+            store.append_to_transcript(sid, {"role": "user", "content": f"msg {i}"})
+        recap = store.build_carryover_recap(sid, max_messages=3)
+        # The user has spoken since; the old alert obeys the normal cap.
+        assert "old alert" not in recap
 
     def test_recap_clips_long_messages(self, store):
         sid = "prev_4"
@@ -432,6 +500,232 @@ class TestCronLiveAdapterDeliveryRecords:
             )
         assert err is None
         record_mock.assert_called_once()
+
+
+class TestWriteaheadRegistry:
+    """Module-level begin/finish plumbing and record_outbound preference."""
+
+    def test_begin_without_recorder_returns_none(self):
+        assert begin_outbound_record("telegram", "123", "hi") is None
+
+    def test_begin_finish_roundtrip(self):
+        rec = _FakeWriteaheadRecorder()
+        set_outbound_writeahead_recorder(rec)
+        handle = begin_outbound_record(
+            "telegram", "123", "alert text", origin="cron job 'x'",
+        )
+        assert handle is not None
+        finish_outbound_record(handle, True, platform_message_id="m-9")
+        assert rec.events == [("begin", "alert text"), ("delivered", "m-9")]
+
+    def test_finish_failure_marks_failed(self):
+        rec = _FakeWriteaheadRecorder()
+        set_outbound_writeahead_recorder(rec)
+        handle = begin_outbound_record("telegram", "123", "alert text")
+        finish_outbound_record(handle, False, error="ws down")
+        assert rec.events[-1] == ("failed", "ws down")
+
+    def test_record_outbound_prefers_writeahead(self):
+        rec = _FakeWriteaheadRecorder()
+        legacy = MagicMock()
+        set_outbound_writeahead_recorder(rec)
+        set_outbound_recorder(legacy)
+        assert record_outbound(
+            "telegram", "123", "text", platform_message_id="m-1",
+        ) is True
+        assert rec.events == [("begin", "text"), ("delivered", "m-1")]
+        legacy.assert_not_called()
+
+    def test_record_outbound_falls_back_to_legacy(self):
+        legacy = MagicMock()
+        set_outbound_recorder(legacy)
+        assert record_outbound("telegram", "123", "text") is True
+        legacy.assert_called_once()
+
+    def test_begin_blank_text_returns_none(self):
+        rec = _FakeWriteaheadRecorder()
+        set_outbound_writeahead_recorder(rec)
+        assert begin_outbound_record("telegram", "123", "   ") is None
+        assert rec.events == []
+
+
+class TestGatewayWriteaheadRecorder:
+    """The gateway-side recorder: write-ahead append, pmid stamp, failure note."""
+
+    def _recorder(self, store):
+        from types import SimpleNamespace
+
+        from gateway.run import _OutboundWriteaheadRecorder
+
+        entry = store.get_or_create_session(_dm_source())
+        runner = SimpleNamespace(
+            session_store=store,
+            _resolve_outbound_session_entry=lambda p, c, t: entry,
+        )
+        return _OutboundWriteaheadRecorder(runner), entry
+
+    def test_begin_appends_turn_before_outcome(self, store):
+        recorder, entry = self._recorder(store)
+        handle = recorder.begin(
+            "telegram", "12345", "porper draft ready", "cron job 'alerts'", None,
+        )
+        assert handle["session_id"] == entry.session_id
+        assert handle["row_id"]
+        msgs = store._db.get_messages(entry.session_id)
+        assert len(msgs) == 1
+        assert msgs[0]["role"] == "assistant"
+        assert msgs[0]["content"].startswith(OUT_OF_BAND_PREFIX)
+        assert "porper draft ready" in msgs[0]["content"]
+
+    def test_mark_delivered_stamps_platform_message_id(self, store):
+        recorder, entry = self._recorder(store)
+        handle = recorder.begin("telegram", "12345", "hello", "origin", None)
+        recorder.mark_delivered(handle, "imsg-778")
+        msgs = store._db.get_messages(entry.session_id)
+        assert msgs[0].get("message_id") == "imsg-778" or \
+            msgs[0].get("platform_message_id") == "imsg-778"
+
+    def test_mark_failed_appends_failure_note(self, store):
+        recorder, entry = self._recorder(store)
+        handle = recorder.begin("telegram", "12345", "hello", "origin", None)
+        recorder.mark_failed(handle, "bridge websocket closed")
+        msgs = store._db.get_messages(entry.session_id)
+        assert len(msgs) == 2
+        assert msgs[1]["content"].startswith(DELIVERY_FAILED_PREFIX)
+        assert "bridge websocket closed" in msgs[1]["content"]
+
+
+class TestCronWriteaheadOrdering:
+    """Cron deliveries must be recorded BEFORE the send and resolved after."""
+
+    def _run(self, events, live_result=None, standalone_result=None,
+             live_exception=None):
+        import asyncio
+        import threading
+
+        from cron.scheduler import _deliver_result
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.extra = {}
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        async def _send(*a, **k):
+            events.append(("send",))
+            if live_exception:
+                raise live_exception
+            return live_result
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+                 patch("gateway.delivery.DeliveryRouter._deliver_to_platform",
+                       new=_send), \
+                 patch("tools.send_message_tool._send_to_platform",
+                       new=AsyncMock(return_value=standalone_result or {"error": "no standalone"})):
+                job = {
+                    "id": "job-1",
+                    "name": "Chessreps critical alerts",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                }
+                return _deliver_result(
+                    job, "polborta case needs you",
+                    adapters={Platform.TELEGRAM: MagicMock()}, loop=loop,
+                )
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            loop.close()
+
+    def test_record_precedes_send_and_resolves_delivered(self):
+        events = []
+        rec = _FakeWriteaheadRecorder(events)
+        set_outbound_writeahead_recorder(rec)
+        err = self._run(
+            events, live_result={"success": True, "message_id": "imsg-42"},
+        )
+        assert err is None
+        kinds = [e[0] for e in events]
+        assert kinds == ["begin", "send", "delivered"]
+        assert events[-1] == ("delivered", "imsg-42")
+
+    def test_all_attempts_failed_marks_failed_once(self):
+        events = []
+        rec = _FakeWriteaheadRecorder(events)
+        set_outbound_writeahead_recorder(rec)
+        err = self._run(
+            events,
+            live_result={"success": False, "error": "live boom"},
+            standalone_result={"error": "standalone boom"},
+        )
+        assert err is not None
+        kinds = [e[0] for e in events]
+        assert kinds.count("begin") == 1
+        assert kinds.count("failed") == 1
+        assert "delivered" not in kinds
+        assert "standalone boom" in events[-1][1]
+
+    def test_standalone_fallback_success_resolves_delivered(self):
+        events = []
+        rec = _FakeWriteaheadRecorder(events)
+        set_outbound_writeahead_recorder(rec)
+        err = self._run(
+            events,
+            live_result={"success": False, "error": "live boom"},
+            standalone_result={"success": True, "message_id": "sa-7"},
+        )
+        assert err is None
+        assert events[-1] == ("delivered", "sa-7")
+        assert [e[0] for e in events].count("begin") == 1
+
+
+class TestWebhookWriteahead:
+    """Webhook direct-deliveries record write-ahead and resolve outcomes."""
+
+    def _make_adapter(self, send_result):
+        from gateway.platforms.webhook import WebhookAdapter
+
+        adapter = WebhookAdapter.__new__(WebhookAdapter)
+        target_adapter = MagicMock()
+        target_adapter.send = AsyncMock(return_value=send_result)
+        runner = MagicMock()
+        runner.adapters = {Platform.TELEGRAM: target_adapter}
+        adapter.gateway_runner = runner
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_success_begins_then_marks_delivered(self):
+        from gateway.platforms.base import SendResult
+
+        events = []
+        rec = _FakeWriteaheadRecorder(events)
+        set_outbound_writeahead_recorder(rec)
+        adapter = self._make_adapter(SendResult(success=True, message_id="w-5"))
+        result = await adapter._deliver_cross_platform(
+            "telegram", "codex done", {"deliver_extra": {"chat_id": "123"}},
+        )
+        assert result.success
+        assert [e[0] for e in events] == ["begin", "delivered"]
+        assert events[-1] == ("delivered", "w-5")
+
+    @pytest.mark.asyncio
+    async def test_failure_marks_failed(self):
+        from gateway.platforms.base import SendResult
+
+        events = []
+        rec = _FakeWriteaheadRecorder(events)
+        set_outbound_writeahead_recorder(rec)
+        adapter = self._make_adapter(SendResult(success=False, error="nope"))
+        result = await adapter._deliver_cross_platform(
+            "telegram", "text", {"deliver_extra": {"chat_id": "123"}},
+        )
+        assert not result.success
+        assert events[0][0] == "begin"
+        assert events[-1] == ("failed", "nope")
 
 
 class TestWebhookDirectDeliverRecords:

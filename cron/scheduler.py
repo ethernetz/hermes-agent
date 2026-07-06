@@ -1193,6 +1193,7 @@ def _send_media_via_adapter(
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
+    sent_names = []
     for media_path, _is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
@@ -1224,8 +1225,35 @@ def _send_media_via_adapter(
                     "Job '%s': media send failed for %s: %s",
                     job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
                 )
+            else:
+                sent_names.append(Path(media_path).name)
         except Exception as e:
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+
+    # Record a stub turn for delivered attachments — they reach the user's
+    # chat as native media with no transcript trace otherwise, so a reply
+    # like "what's that file?" would hit an agent that never saw them.
+    if sent_names:
+        try:
+            from gateway.outbound_memory import record_outbound
+
+            platform_name = getattr(platform, "value", None) or str(
+                platform or getattr(adapter, "platform", "") or ""
+            )
+            record_outbound(
+                platform_name,
+                str(chat_id),
+                "[sent {n} attachment(s): {names}]".format(
+                    n=len(sent_names), names=", ".join(sent_names)
+                ),
+                origin=f"cron job '{job.get('name') or job.get('id', 'cron')}'",
+                thread_id=(metadata or {}).get("thread_id"),
+            )
+        except Exception:
+            logger.debug(
+                "Job '%s': failed to record media stub", job.get("id", "?"),
+                exc_info=True,
+            )
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -1391,6 +1419,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         return msg
 
     delivery_errors = []
+    # Write-ahead outbound records for this delivery, one per non-mirrored
+    # target: begun before the first send attempt, resolved (delivered /
+    # failed) once the target's outcome is known. Any record still pending
+    # after the loop belongs to a target whose every attempt failed.
+    _oob_pending = []
 
     for target in targets:
         platform_name = target["platform"]
@@ -1444,6 +1477,26 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
         target_errors = []
+
+        # Write-ahead record: put this delivery in the target chat's session
+        # transcript BEFORE any send attempt, so a message can never reach
+        # the user without being a turn their reply will hit. Skipped for
+        # origin-mirrored targets — the seed/mirror machinery on the live
+        # path owns transcript writes there (and record-after-send remains
+        # the fallback for those, unchanged). oob_state["done"] flips when a
+        # success path resolves the record; unresolved records are marked
+        # failed after the loop.
+        oob_state = {"handle": None, "done": False, "errors": target_errors}
+        if not mirror_this_target and cleaned_delivery_content.strip():
+            from gateway.outbound_memory import begin_outbound_record
+            oob_state["handle"] = begin_outbound_record(
+                platform_name,
+                chat_id,
+                cleaned_delivery_content.strip(),
+                origin=f"cron job '{job.get('name') or job['id']}'",
+                thread_id=thread_id,
+            )
+        _oob_pending.append(oob_state)
 
         # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
         # this platform generically from its config ``extra``. Default "thread"
@@ -1591,6 +1644,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
+                live_pmid = None  # platform message id from a confirmed live send
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
@@ -1688,9 +1742,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             if isinstance(send_result, dict):
                                 send_success = bool(send_result.get("success", False))
                                 send_raw_response = send_result.get("raw_response")
+                                if send_success:
+                                    live_pmid = send_result.get("message_id")
                             else:
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
+                                if send_success:
+                                    live_pmid = getattr(send_result, "message_id", None)
 
                             if not send_success:
                                 if isinstance(send_result, dict):
@@ -1780,25 +1838,36 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         thread_id=thread_id, user_id=origin_user_id,
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
-                    # Record the delivery in the target chat's session
-                    # transcript so the gateway agent remembers what this job
-                    # just told the user. The live-adapter path is the normal
-                    # one when the gateway is up; recording only in the
-                    # standalone fallback below leaves every healthy delivery
-                    # unremembered (2026-07-06 regression: the agent denied
-                    # knowledge of an alert it had texted 5 minutes earlier).
-                    # Skip when the mirror or a seed above already put this
-                    # text in the transcript, so a single delivery never
-                    # lands twice.
+                    # Resolve the write-ahead record (or record post-hoc when
+                    # no write-ahead recorder is registered) so the gateway
+                    # agent remembers what this job just told the user. The
+                    # live-adapter path is the normal one when the gateway is
+                    # up; recording only in the standalone fallback below
+                    # leaves every healthy delivery unremembered (2026-07-06
+                    # regression: the agent denied knowledge of an alert it
+                    # had texted 5 minutes earlier). Skip when the mirror or
+                    # a seed above already put this text in the transcript,
+                    # so a single delivery never lands twice.
                     if not (thread_seeded or inchannel_seeded or mirror_this_target):
-                        from gateway.outbound_memory import record_outbound
-                        record_outbound(
-                            platform_name,
-                            chat_id,
-                            cleaned_delivery_content.strip(),
-                            origin=f"cron job '{job.get('name') or job['id']}'",
-                            thread_id=thread_id,
+                        from gateway.outbound_memory import (
+                            finish_outbound_record,
+                            record_outbound,
                         )
+                        if oob_state["handle"] is not None:
+                            finish_outbound_record(
+                                oob_state["handle"], True,
+                                platform_message_id=live_pmid,
+                            )
+                        elif cleaned_delivery_content.strip():
+                            record_outbound(
+                                platform_name,
+                                chat_id,
+                                cleaned_delivery_content.strip(),
+                                origin=f"cron job '{job.get('name') or job['id']}'",
+                                thread_id=thread_id,
+                                platform_message_id=live_pmid,
+                            )
+                    oob_state["done"] = True
             except Exception as e:
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
@@ -1889,20 +1958,47 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 thread_id=thread_id, user_id=origin_user_id,
                 enabled=mirror_this_target and not thread_seeded,
             )
-            # Record the delivery in the target chat's session transcript so
-            # the gateway agent remembers what this job just told the user
-            # (no-op when the gateway isn't running — see outbound_memory).
-            # Skip when the origin-chat mirror above already covered it, so a
-            # single delivery never lands in the transcript twice.
+            # Resolve the write-ahead record (or record post-hoc when no
+            # write-ahead recorder is registered) so the gateway agent
+            # remembers what this job just told the user (no-op when the
+            # gateway isn't running — see outbound_memory). Skip when the
+            # origin-chat mirror above already covered it, so a single
+            # delivery never lands in the transcript twice.
             if not (mirror_this_target and not thread_seeded):
-                from gateway.outbound_memory import record_outbound
-                record_outbound(
-                    platform_name,
-                    chat_id,
-                    cleaned_delivery_content.strip(),
-                    origin=f"cron job '{job.get('name') or job['id']}'",
-                    thread_id=thread_id,
+                from gateway.outbound_memory import (
+                    finish_outbound_record,
+                    record_outbound,
                 )
+                _standalone_pmid = (
+                    result.get("message_id") if isinstance(result, dict) else None
+                )
+                if oob_state["handle"] is not None:
+                    finish_outbound_record(
+                        oob_state["handle"], True,
+                        platform_message_id=_standalone_pmid,
+                    )
+                elif cleaned_delivery_content.strip():
+                    record_outbound(
+                        platform_name,
+                        chat_id,
+                        cleaned_delivery_content.strip(),
+                        origin=f"cron job '{job.get('name') or job['id']}'",
+                        thread_id=thread_id,
+                        platform_message_id=_standalone_pmid,
+                    )
+            oob_state["done"] = True
+
+    # Resolve write-ahead records for targets whose every send attempt
+    # failed: the transcript keeps the message (write-ahead already put it
+    # there) plus an explicit failure note, so the agent knows the user
+    # never saw it — instead of the message silently vanishing from memory.
+    for _st in _oob_pending:
+        if _st["handle"] is not None and not _st["done"]:
+            from gateway.outbound_memory import finish_outbound_record
+            finish_outbound_record(
+                _st["handle"], False,
+                error="; ".join(_st["errors"]) or "delivery failed",
+            )
 
     if delivery_errors:
         return "; ".join(delivery_errors)

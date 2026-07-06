@@ -1212,16 +1212,43 @@ class WebhookAdapter(BasePlatformAdapter):
         if thread_id:
             metadata = {"thread_id": thread_id}
 
+        # Write-ahead: record the delivery in the target chat's session
+        # transcript BEFORE the send, then resolve with the outcome — so the
+        # gateway agent remembers what was pushed to the user, and a failed
+        # push is visible as a failed turn instead of vanishing. Falls back
+        # to post-hoc recording when no write-ahead recorder is registered.
+        from gateway.outbound_memory import (
+            begin_outbound_record,
+            finish_outbound_record,
+            record_outbound,
+        )
+        oob_handle = begin_outbound_record(
+            platform_name,
+            chat_id,
+            content,
+            origin="a webhook direct-delivery",
+            thread_id=thread_id,
+        )
+
         result = await adapter.send(chat_id, content, metadata=metadata)
         if result and result.success:
-            # Record the delivery in the target chat's session transcript so
-            # the gateway agent remembers what was pushed to the user.
-            from gateway.outbound_memory import record_outbound
-            record_outbound(
-                platform_name,
-                chat_id,
-                content,
-                origin="a webhook direct-delivery",
-                thread_id=thread_id,
+            if oob_handle is not None:
+                finish_outbound_record(
+                    oob_handle, True,
+                    platform_message_id=getattr(result, "message_id", None),
+                )
+            else:
+                record_outbound(
+                    platform_name,
+                    chat_id,
+                    content,
+                    origin="a webhook direct-delivery",
+                    thread_id=thread_id,
+                    platform_message_id=getattr(result, "message_id", None),
+                )
+        elif oob_handle is not None:
+            finish_outbound_record(
+                oob_handle, False,
+                error=(getattr(result, "error", None) or "no result from adapter"),
             )
         return result

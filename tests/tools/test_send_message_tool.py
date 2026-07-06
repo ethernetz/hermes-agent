@@ -478,6 +478,43 @@ class TestSendMessageTool:
             user_id="user-123",
         )
 
+    def test_sessionless_chat_falls_back_to_record_outbound(self):
+        """First-ever message to a chat with no session must still be recorded.
+
+        mirror_to_session only appends to an existing session; when it
+        returns False the send tool records via record_outbound (which
+        creates the session) so the recipient's reply doesn't land in a
+        conversation that never said anything.
+        """
+        config, _telegram_cfg = _make_config()
+
+        record_mock = MagicMock(return_value=True)
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform",
+                   new=AsyncMock(return_value={"success": True, "message_id": "tg-31"})), \
+             patch("gateway.mirror.mirror_to_session", return_value=False), \
+             patch("gateway.outbound_memory.record_outbound", record_mock):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:12345",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert result.get("mirrored") == "recorded"
+        record_mock.assert_called_once()
+        args, kwargs = record_mock.call_args
+        assert args[0] == "telegram"
+        assert args[1] == "12345"
+        assert args[2] == "hello"
+        assert kwargs.get("platform_message_id") == "tg-31"
+
     def test_media_tag_outside_allowed_roots_is_not_sent(self, tmp_path, monkeypatch):
         # This test exercises the strict-allowlist path; force strict mode on
         # and disable recency trust so the freshly-written tmp_path file is

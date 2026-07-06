@@ -2122,6 +2122,44 @@ class SessionStore:
             logger.debug("has_platform_message_id lookup failed", exc_info=True)
             return False
 
+    def append_out_of_band(
+        self,
+        session_id: str,
+        content: str,
+        timestamp: Any = None,
+    ) -> Optional[int]:
+        """Append an out-of-band assistant turn and return its message row id.
+
+        Write-ahead variant of append_to_transcript for the outbound delivery
+        recorder: the returned row id lets the caller stamp the row with the
+        platform message id (set_message_platform_id) once the send is
+        confirmed. Returns None when no DB is available or the write fails.
+        """
+        if not self._db:
+            return None
+        try:
+            return self._db.append_message(
+                session_id=session_id,
+                role="assistant",
+                content=content,
+                timestamp=timestamp,
+            )
+        except Exception as e:
+            logger.debug("Out-of-band append failed for %s: %s", session_id, e)
+            return None
+
+    def set_message_platform_id(
+        self, message_id: int, platform_message_id: str
+    ) -> bool:
+        """Stamp a persisted message row with its platform-side message id."""
+        if not self._db:
+            return False
+        try:
+            return self._db.set_message_platform_id(message_id, platform_message_id)
+        except Exception as e:
+            logger.debug("set_message_platform_id failed for %s: %s", message_id, e)
+            return False
+
     def find_source_for_chat(
         self,
         platform: Platform,
@@ -2177,7 +2215,10 @@ class SessionStore:
         if not history:
             return None
 
-        lines: List[str] = []
+        from gateway.outbound_memory import OUT_OF_BAND_PREFIX
+
+        # (is_user, is_out_of_band, rendered_line) per usable message
+        entries: List[tuple] = []
         for msg in history:
             role = msg.get("role")
             if role not in ("user", "assistant"):
@@ -2193,14 +2234,26 @@ class SessionStore:
             if not isinstance(content, str) or not content.strip():
                 continue
             text = content.strip()
+            is_oob = role == "assistant" and text.startswith(OUT_OF_BAND_PREFIX)
             if len(text) > per_message_chars:
                 text = text[: per_message_chars - 1].rstrip() + "…"
             speaker = "User" if role == "user" else "You"
-            lines.append(f"{speaker}: {text}")
+            entries.append((role == "user", is_oob, f"{speaker}: {text}"))
 
-        if not lines:
+        if not entries:
             return None
-        lines = lines[-max_messages:]
+        # Keep the last max_messages — PLUS every out-of-band delivery newer
+        # than the user's last message, regardless of the cap. An alert the
+        # user hasn't answered yet must never fall out of the recap window
+        # just because a burst of later deliveries pushed it past the cap.
+        keep = set(range(max(0, len(entries) - max_messages), len(entries)))
+        user_indices = [i for i, (is_user, _, _) in enumerate(entries) if is_user]
+        last_user_idx = user_indices[-1] if user_indices else -1
+        keep.update(
+            i for i, (_, is_oob, _) in enumerate(entries)
+            if is_oob and i > last_user_idx
+        )
+        lines = [line for i, (_, _, line) in enumerate(entries) if i in keep]
         recap = "\n".join(lines)
         if len(recap) > max_chars:
             recap = recap[-max_chars:]

@@ -2713,6 +2713,76 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
+class _OutboundWriteaheadRecorder:
+    """Write-ahead outbound recorder registered with gateway.outbound_memory.
+
+    ``begin`` appends the out-of-band turn to the target chat's session
+    transcript BEFORE the platform send; ``mark_delivered``/``mark_failed``
+    resolve the record with the outcome. This inverts the old post-hoc
+    ordering so a message can never reach the user's phone without already
+    being a turn in the conversation their next reply will hit — the failure
+    mode flips from "on phone, not in transcript" (invisible) to "in
+    transcript, marked failed" (visible).
+    """
+
+    def __init__(self, runner: "GatewayRunner"):
+        self._runner = runner
+
+    def begin(self, platform_name, chat_id, text, origin, thread_id):
+        entry = self._runner._resolve_outbound_session_entry(
+            platform_name, chat_id, thread_id,
+        )
+        if entry is None:
+            return None
+        from gateway.outbound_memory import format_outbound_record
+        row_id = self._runner.session_store.append_out_of_band(
+            entry.session_id,
+            format_outbound_record(text, origin),
+            timestamp=datetime.now().isoformat(),
+        )
+        if row_id is None:
+            logger.warning(
+                "outbound-memory: write-ahead append failed for %s:%s",
+                platform_name, chat_id,
+            )
+            return None
+        logger.info(
+            "outbound-memory: recorded %s delivery to %s:%s in session %s (row %s)",
+            origin, platform_name, chat_id, entry.session_id, row_id,
+        )
+        return {
+            "session_id": entry.session_id,
+            "row_id": row_id,
+            "platform_name": platform_name,
+            "chat_id": chat_id,
+        }
+
+    def mark_delivered(self, handle, platform_message_id):
+        if not handle:
+            return
+        if platform_message_id:
+            self._runner.session_store.set_message_platform_id(
+                handle.get("row_id"), platform_message_id,
+            )
+
+    def mark_failed(self, handle, error):
+        if not handle:
+            return
+        from gateway.outbound_memory import DELIVERY_FAILED_PREFIX
+        err_text = str(error or "unknown error")[:500]
+        self._runner.session_store.append_out_of_band(
+            handle.get("session_id"),
+            f"{DELIVERY_FAILED_PREFIX} ({err_text}). "
+            "The user did NOT receive it.]",
+            timestamp=datetime.now().isoformat(),
+        )
+        logger.warning(
+            "outbound-memory: delivery recorded at row %s to %s:%s FAILED: %s",
+            handle.get("row_id"), handle.get("platform_name"),
+            handle.get("chat_id"), err_text,
+        )
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -2797,12 +2867,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         self.delivery_router = DeliveryRouter(self.config)
 
-        # Register the out-of-band delivery recorder so cron jobs and
+        # Register the out-of-band delivery recorders so cron jobs and
         # webhook direct-deliveries land in the target chat's session
         # transcript — without this the agent has amnesia about messages
-        # the user received "from it" outside a conversation turn.
-        from gateway.outbound_memory import set_outbound_recorder
+        # the user received "from it" outside a conversation turn. The
+        # write-ahead recorder is the primary mechanism (record BEFORE the
+        # send, resolve with the outcome after); the legacy post-hoc
+        # callable stays registered for compatibility.
+        from gateway.outbound_memory import (
+            set_outbound_recorder,
+            set_outbound_writeahead_recorder,
+        )
         set_outbound_recorder(self._record_outbound_delivery)
+        set_outbound_writeahead_recorder(_OutboundWriteaheadRecorder(self))
 
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -10448,30 +10525,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
-    def _record_outbound_delivery(
+    def _resolve_outbound_session_entry(
         self,
         platform_name: str,
         chat_id: str,
-        text: str,
-        origin: str,
         thread_id: Optional[str] = None,
-    ) -> None:
-        """Append an out-of-band delivery to the target chat's session.
+    ):
+        """Resolve the session an out-of-band delivery record should land in.
 
-        Called (via gateway.outbound_memory) by the cron scheduler and
-        webhook direct-deliver paths after a successful send, from any
-        thread. Best-effort by contract: raising here is caught and logged
-        by record_outbound().
+        Prefers the origin of an existing session for this chat so the
+        record lands in exactly the session the user's replies will hit
+        (chat_type and per-user isolation affect the session key); creates
+        one otherwise. Returns None for unknown platforms.
         """
         try:
             platform = Platform(platform_name.lower())
         except (ValueError, KeyError):
             logger.debug("outbound-memory: unknown platform %r", platform_name)
-            return
+            return None
 
-        # Prefer the origin of an existing session for this chat so the
-        # record lands in exactly the session the user's replies will hit
-        # (chat_type and per-user isolation affect the session key).
         source = self.session_store.find_source_for_chat(
             platform, str(chat_id), thread_id=thread_id,
         )
@@ -10485,9 +10557,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_name=str(chat_id),
                 thread_id=str(thread_id) if thread_id else None,
             )
+        return self.session_store.get_or_create_session(source)
+
+    def _record_outbound_delivery(
+        self,
+        platform_name: str,
+        chat_id: str,
+        text: str,
+        origin: str,
+        thread_id: Optional[str] = None,
+    ) -> None:
+        """Append an out-of-band delivery to the target chat's session.
+
+        Legacy post-hoc recorder (called via gateway.outbound_memory after a
+        successful send, from any thread). The write-ahead recorder
+        (_OutboundWriteaheadRecorder) is the primary mechanism; this stays
+        registered for compatibility. Best-effort by contract: raising here
+        is caught and logged by record_outbound().
+        """
+        entry = self._resolve_outbound_session_entry(
+            platform_name, chat_id, thread_id,
+        )
+        if entry is None:
+            return
 
         from gateway.outbound_memory import format_outbound_record
-        entry = self.session_store.get_or_create_session(source)
         self.session_store.append_to_transcript(
             entry.session_id,
             {

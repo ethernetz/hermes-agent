@@ -462,6 +462,25 @@ def _handle_send(args):
                     user_id=user_id,
                 ):
                     result["mirrored"] = True
+                else:
+                    # mirror_to_session only appends to an EXISTING session —
+                    # a first-ever message to a new chat reaches the user but
+                    # would leave no transcript trace, so their reply lands in
+                    # a session that never said anything. record_outbound
+                    # creates the session (gap closed 2026-07-06).
+                    from gateway.outbound_memory import record_outbound
+                    if record_outbound(
+                        platform_name,
+                        chat_id,
+                        mirror_text,
+                        origin=f"a send_message from a {source_label} session",
+                        thread_id=thread_id,
+                        platform_message_id=(
+                            result.get("message_id")
+                            if isinstance(result, dict) else None
+                        ),
+                    ):
+                        result["mirrored"] = "recorded"
             except Exception:
                 pass
 
