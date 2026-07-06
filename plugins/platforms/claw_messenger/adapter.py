@@ -215,7 +215,10 @@ class ClawMessengerAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "Claw Messenger"
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # is_reconnect (base contract since v0.18) exists for adapters that
+        # buffer a server-side update queue across outages; the claw relay
+        # has none, so the flag is accepted and ignored.
         if not self.settings.api_key:
             self._set_fatal_error("config_missing", "CLAW_MESSENGER_API_KEY is not set", retryable=False)
             return False
