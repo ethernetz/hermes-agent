@@ -435,6 +435,52 @@ class ClawMessengerAdapter(BasePlatformAdapter):
         is_group = data.get("isGroup") is True
         chat_id = str(data.get("chatId") or "")
         attachments = data.get("attachments") or []
+
+        # Swipe-reply / quote metadata. The relay payload contract for
+        # replies is not pinned down, so accept the plausible spellings
+        # (BlueBubbles-style iMessage bridges use threadOriginatorGuid;
+        # associatedMessageGuid also carries tapback targets). When only a
+        # GUID arrives, the gateway resolves the quoted text from the
+        # transcript via platform_message_id (outbound turns are stamped
+        # with theirs by the write-ahead recorder).
+        reply_to_id = None
+        reply_to_text = None
+        for _key in (
+            "replyToMessageId", "replyToId", "replyTo", "quotedMessageId",
+            "threadOriginatorGuid", "associatedMessageGuid",
+        ):
+            _val = data.get(_key)
+            if isinstance(_val, dict):
+                reply_to_id = str(
+                    _val.get("messageId") or _val.get("guid") or ""
+                ) or None
+                reply_to_text = str(_val.get("text") or "") or None
+            elif _val:
+                reply_to_id = str(_val)
+            if reply_to_id:
+                break
+        if not reply_to_text:
+            for _key in ("replyToText", "quotedText"):
+                if data.get(_key):
+                    reply_to_text = str(data.get(_key))
+                    break
+        # Discovery: surface payload keys we don't consume yet, so the next
+        # real swipe-reply reveals what the relay actually sends.
+        _known_keys = {
+            "type", "from", "text", "messageId", "isGroup", "chatId",
+            "attachments", "direction", "status", "fromMe", "isFromMe",
+            "isOutgoing", "outgoing", "timestamp", "chatName", "service",
+            "replyToMessageId", "replyToId", "replyTo", "quotedMessageId",
+            "threadOriginatorGuid", "associatedMessageGuid", "replyToText",
+            "quotedText",
+        }
+        _extra_keys = sorted(set(data.keys()) - _known_keys)
+        if _extra_keys:
+            logger.info(
+                "[claw_messenger] inbound payload has unconsumed keys: %s",
+                _extra_keys,
+            )
+
         media_urls, media_types, attachment_summaries = _attachment_media_fields(attachments)
         if attachments:
             keys = sorted({k for att in attachments if isinstance(att, dict) for k in att.keys()})
@@ -494,6 +540,8 @@ class ClawMessengerAdapter(BasePlatformAdapter):
             message_id=message_id or None,
             media_urls=media_urls,
             media_types=media_types,
+            reply_to_message_id=reply_to_id,
+            reply_to_text=reply_to_text,
         )
 
         if not is_group and from_id:

@@ -585,6 +585,19 @@ class TestGatewayWriteaheadRecorder:
         assert msgs[0].get("message_id") == "imsg-778" or \
             msgs[0].get("platform_message_id") == "imsg-778"
 
+    def test_stamped_turn_resolvable_by_platform_id(self, store):
+        """Reply anchoring round trip: stamp on delivery, resolve on reply."""
+        recorder, entry = self._recorder(store)
+        handle = recorder.begin(
+            "telegram", "12345", "porper draft ready", "cron job 'alerts'", None,
+        )
+        recorder.mark_delivered(handle, "imsg-guid-42")
+        quoted = store.lookup_message_by_platform_id("imsg-guid-42")
+        assert quoted is not None
+        assert quoted["role"] == "assistant"
+        assert "porper draft ready" in quoted["content"]
+        assert store.lookup_message_by_platform_id("no-such-guid") is None
+
     def test_mark_failed_appends_failure_note(self, store):
         recorder, entry = self._recorder(store)
         handle = recorder.begin("telegram", "12345", "hello", "origin", None)

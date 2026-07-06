@@ -2160,6 +2160,20 @@ class SessionStore:
             logger.debug("set_message_platform_id failed for %s: %s", message_id, e)
             return False
 
+    def lookup_message_by_platform_id(
+        self, platform_message_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a platform message id to its recorded turn (reply anchoring)."""
+        if not self._db:
+            return None
+        try:
+            return self._db.get_message_by_platform_id(platform_message_id)
+        except Exception:
+            logger.debug(
+                "lookup_message_by_platform_id failed", exc_info=True,
+            )
+            return None
+
     def find_source_for_chat(
         self,
         platform: Platform,

@@ -4860,6 +4860,30 @@ class SessionDB:
             )
             return cursor.fetchone() is not None
 
+    def get_message_by_platform_id(
+        self, platform_message_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Find the most recent message carrying this platform message id.
+
+        Used for reply anchoring: an inbound swipe-reply carries the quoted
+        message's platform GUID; this resolves it back to the recorded turn
+        (inbound turns store their platform id on persist; outbound
+        out-of-band turns are stamped by the write-ahead recorder). Returns
+        {role, content, session_id} or None.
+        """
+        if not (platform_message_id or "").strip():
+            return None
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT role, content, session_id FROM messages "
+                "WHERE platform_message_id = ? ORDER BY id DESC LIMIT 1",
+                (str(platform_message_id),),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return {"role": row[0], "content": row[1], "session_id": row[2]}
+
     def set_message_platform_id(
         self, message_id: int, platform_message_id: str
     ) -> bool:

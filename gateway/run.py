@@ -10424,6 +10424,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"{message_text}"
                 )
 
+        if getattr(event, "reply_to_message_id", None) and not getattr(
+            event, "reply_to_text", None,
+        ):
+            # GUID-only reply (e.g. an iMessage swipe-reply whose relay sends
+            # just the quoted message's id): resolve the quoted text from the
+            # transcript. Inbound turns persist their platform id; outbound
+            # out-of-band turns are stamped by the write-ahead recorder — so
+            # a reply to a days-old cron alert resolves even across session
+            # resets, without any search.
+            try:
+                _quoted = self.session_store.lookup_message_by_platform_id(
+                    str(event.reply_to_message_id)
+                )
+                if _quoted and isinstance(_quoted.get("content"), str):
+                    _content = _quoted["content"]
+                    from gateway.outbound_memory import OUT_OF_BAND_PREFIX
+                    if _content.startswith(OUT_OF_BAND_PREFIX):
+                        # Drop the recorder's marker header; the user saw
+                        # only the message body.
+                        _, _, _body = _content.partition("]\n")
+                        _content = _body or _content
+                    event.reply_to_text = _content.strip()[:500]
+                    event.reply_to_is_own_message = (
+                        _quoted.get("role") == "assistant"
+                    )
+            except Exception:
+                logger.debug("reply_to platform-id lookup failed", exc_info=True)
+
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer — even when the quoted text
             # already appears in history. The prefix isn't deduplication, it's
