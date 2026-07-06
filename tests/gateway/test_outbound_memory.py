@@ -364,6 +364,76 @@ class TestCronDeliveryRecords:
         record_mock.assert_not_called()
 
 
+class TestCronLiveAdapterDeliveryRecords:
+    """The LIVE-ADAPTER delivery path must also record via record_outbound.
+
+    Regression test for the 2026-07-06 incident: after the v0.18 merge the
+    record_outbound call survived only in the standalone fallback path, so
+    every healthy delivery (gateway up, live adapter connected — the normal
+    case) was texted to the user but never recorded. The agent then denied
+    knowledge of a CS alert it had sent 5 minutes earlier.
+    """
+
+    def _run_live_delivery(self, record_mock, deliver_result=None):
+        import asyncio
+        import threading
+
+        from cron.scheduler import _deliver_result
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.extra = {}
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+                 patch("gateway.delivery.DeliveryRouter._deliver_to_platform",
+                       new=AsyncMock(return_value=deliver_result or {"success": True})), \
+                 patch("gateway.outbound_memory.record_outbound", record_mock):
+                job = {
+                    "id": "job-1",
+                    "name": "Chessreps critical alerts",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                }
+                adapters = {Platform.TELEGRAM: MagicMock()}
+                return _deliver_result(
+                    job,
+                    "polborta@gmail.com's case needs you now",
+                    adapters=adapters,
+                    loop=loop,
+                )
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+            loop.close()
+
+    def test_live_adapter_delivery_is_recorded(self):
+        record_mock = MagicMock(return_value=True)
+        err = self._run_live_delivery(record_mock)
+        assert err is None
+        record_mock.assert_called_once()
+        args, kwargs = record_mock.call_args
+        assert args[0] == "telegram"
+        assert args[1] == "123"
+        assert "polborta@gmail.com" in args[2]
+        assert kwargs["origin"] == "cron job 'Chessreps critical alerts'"
+
+    def test_failed_live_adapter_send_falls_back_and_records_once(self):
+        record_mock = MagicMock(return_value=True)
+        with patch("tools.send_message_tool._send_to_platform",
+                   new=AsyncMock(return_value={"success": True})):
+            err = self._run_live_delivery(
+                record_mock, deliver_result={"success": False, "error": "boom"},
+            )
+        assert err is None
+        record_mock.assert_called_once()
+
+
 class TestWebhookDirectDeliverRecords:
     """Webhook deliver_only routes must record successful cross-platform sends."""
 

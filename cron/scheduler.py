@@ -1780,6 +1780,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         thread_id=thread_id, user_id=origin_user_id,
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
+                    # Record the delivery in the target chat's session
+                    # transcript so the gateway agent remembers what this job
+                    # just told the user. The live-adapter path is the normal
+                    # one when the gateway is up; recording only in the
+                    # standalone fallback below leaves every healthy delivery
+                    # unremembered (2026-07-06 regression: the agent denied
+                    # knowledge of an alert it had texted 5 minutes earlier).
+                    # Skip when the mirror or a seed above already put this
+                    # text in the transcript, so a single delivery never
+                    # lands twice.
+                    if not (thread_seeded or inchannel_seeded or mirror_this_target):
+                        from gateway.outbound_memory import record_outbound
+                        record_outbound(
+                            platform_name,
+                            chat_id,
+                            cleaned_delivery_content.strip(),
+                            origin=f"cron job '{job.get('name') or job['id']}'",
+                            thread_id=thread_id,
+                        )
             except Exception as e:
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
