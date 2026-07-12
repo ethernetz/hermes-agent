@@ -31,7 +31,9 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("deliver", job["id"]))
         return None
 
-    def fake_mark(jid, ok, err=None, delivery_error=None):
+    def fake_mark(
+        jid, ok, err=None, delivery_error=None, delivery_status=None
+    ):
         calls.append(("mark", jid, ok))
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
@@ -78,6 +80,37 @@ def test_run_one_job_silent_skips_delivery(monkeypatch):
     assert "deliver" not in kinds
 
 
+def test_run_one_job_silent_marks_delivery_not_attempted(monkeypatch):
+    calls = _patch_pipeline(monkeypatch, silent_marker_in="[SILENT]")
+    statuses = []
+
+    def capture_mark(
+        jid, ok, err=None, delivery_error=None, delivery_status=None
+    ):
+        statuses.append(delivery_status)
+
+    monkeypatch.setattr(s, "mark_job_run", capture_mark)
+    assert s.run_one_job({"id": "silent-status", "name": "t"}) is True
+    assert statuses == ["not_attempted"]
+    assert not any(call[0] == "deliver" for call in calls)
+
+
+def test_run_one_job_local_delivery_is_not_receipt_confirmed(monkeypatch):
+    _patch_pipeline(monkeypatch, final="local report")
+    statuses = []
+
+    def capture_mark(
+        jid, ok, err=None, delivery_error=None, delivery_status=None
+    ):
+        statuses.append(delivery_status)
+
+    monkeypatch.setattr(s, "mark_job_run", capture_mark)
+    assert s.run_one_job(
+        {"id": "local-status", "name": "t", "deliver": "local"}
+    ) is True
+    assert statuses == ["not_attempted"]
+
+
 def test_run_one_job_empty_response_is_soft_failure(monkeypatch):
     """An empty final response marks the run as NOT ok (issue #8585)."""
     calls = _patch_pipeline(monkeypatch, final="   ")
@@ -110,7 +143,7 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
     marks = []
     monkeypatch.setattr(
         s, "mark_job_run",
-        lambda jid, ok, err=None, delivery_error=None: marks.append((jid, ok)),
+        lambda jid, ok, err=None, delivery_error=None, delivery_status=None: marks.append((jid, ok)),
     )
 
     ok = s.run_one_job({"id": "j6", "name": "t"})

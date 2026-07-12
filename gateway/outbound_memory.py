@@ -31,6 +31,7 @@ OUT_OF_BAND_PREFIX = "[out-of-band message sent to this chat"
 # Follow-up note appended when a write-ahead-recorded delivery fails, so the
 # agent knows the user never saw the message above it.
 DELIVERY_FAILED_PREFIX = "[delivery status: the out-of-band message above FAILED to deliver"
+DELIVERY_UNKNOWN_PREFIX = "[delivery status: confirmation for the out-of-band message above is UNKNOWN"
 
 _lock = threading.Lock()
 _recorder: Optional[Callable[[str, str, str, str, Optional[str]], None]] = None
@@ -113,6 +114,7 @@ def finish_outbound_record(
     success: bool,
     platform_message_id: Optional[str] = None,
     error: Optional[str] = None,
+    ambiguous: bool = False,
 ) -> None:
     """Resolve a write-ahead record with the delivery outcome.
 
@@ -130,6 +132,8 @@ def finish_outbound_record(
     try:
         if success:
             recorder.mark_delivered(handle, platform_message_id)
+        elif ambiguous and hasattr(recorder, "mark_ambiguous"):
+            recorder.mark_ambiguous(handle, error or "delivery outcome unknown")
         else:
             recorder.mark_failed(handle, error or "delivery failed")
     except Exception:

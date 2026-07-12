@@ -607,6 +607,7 @@ def register(ctx) -> None:
         install_hint="websockets must be installed in the Hermes environment",
         allowed_users_env="CLAW_MESSENGER_ALLOWED_USERS",
         allow_all_env="CLAW_MESSENGER_ALLOW_ALL_USERS",
+        cron_deliver_env_var="CLAW_MESSENGER_HOME_CHANNEL",
         max_message_length=10000,
         pii_safe=True,
         allow_update_command=True,

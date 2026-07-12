@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from dataclasses import dataclass, field
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -45,6 +46,33 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DeliveryReport:
+    """Machine-readable result of one cron delivery attempt.
+
+    ``error`` preserves the historical human-readable return contract while
+    the additional fields let the durable outbox distinguish a confirmed
+    platform acknowledgement from an ambiguous in-flight timeout.
+    """
+
+    error: Optional[str] = None
+    receipts: list[dict[str, Any]] = field(default_factory=list)
+    ambiguous: list[dict[str, Any]] = field(default_factory=list)
+    failed: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def confirmed(self) -> bool:
+        return bool(self.receipts) and not self.ambiguous and not self.failed
+
+
+@dataclass
+class MediaDeliveryReport:
+    """Per-send acknowledgements for live native-media delivery."""
+
+    receipts: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
@@ -237,12 +265,58 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch
+from cron.jobs import (
+    advance_next_run,
+    claim_dispatch,
+    get_due_jobs,
+    mark_job_delivery,
+    mark_job_run,
+    save_job_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+
+# A trusted cron pre-run script may request an idempotent source acknowledgement
+# after (and only after) explicit platform delivery success.  The marker is
+# stripped before prompt construction/user delivery and persisted alongside the
+# outbox row.  The same script is invoked with the declared args; scripts cannot
+# use this to select an arbitrary executable.
+_DELIVERY_ACK_PREFIX = "__HERMES_DELIVERY_ACK__="
+_delivery_ack_var: contextvars.ContextVar[Optional[dict[str, Any]]] = (
+    contextvars.ContextVar("cron_delivery_ack", default=None)
+)
+
+
+def _extract_delivery_ack_directive(output: str) -> tuple[str, Optional[dict[str, Any]]]:
+    """Remove and validate a script-emitted delivery-ack directive."""
+    if not output or _DELIVERY_ACK_PREFIX not in output:
+        return output, None
+    kept: list[str] = []
+    directive: Optional[dict[str, Any]] = None
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(_DELIVERY_ACK_PREFIX):
+            kept.append(line)
+            continue
+        raw = stripped[len(_DELIVERY_ACK_PREFIX):]
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            logger.warning("Ignoring invalid cron delivery ack directive")
+            continue
+        args = parsed.get("args") if isinstance(parsed, dict) else None
+        if (
+            not isinstance(args, list)
+            or len(args) > 16
+            or any(not isinstance(arg, str) or len(arg) > 1000 for arg in args)
+        ):
+            logger.warning("Ignoring unsafe cron delivery ack args")
+            continue
+        directive = {"args": list(args)}
+    return "\n".join(kept).strip(), directive
 
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
@@ -885,6 +959,26 @@ def _is_known_delivery_platform(platform_name: str) -> bool:
     return bool(_plugin_cron_env_var(name))
 
 
+def _is_registered_explicit_delivery_platform(platform_name: str) -> bool:
+    """Whether a concrete target names a built-in or registered plugin.
+
+    A plugin only needs ``cron_deliver_env_var`` for *implicit/home-channel*
+    routing. Explicit targets already contain their chat ID, so requiring a
+    home env var here rejects valid plugins (notably Claw Messenger) during an
+    outbox retry even though the initial explicit-target resolution succeeded.
+    """
+    name = platform_name.lower()
+    if name in _KNOWN_DELIVERY_PLATFORMS:
+        return True
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+        from gateway.platform_registry import platform_registry
+        return platform_registry.is_registered(name)
+    except Exception:
+        return False
+
+
 def _resolve_home_env_var(platform_name: str) -> str:
     """Return the env var name for a platform's cron home channel.
 
@@ -1137,6 +1231,36 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
     Duplicate (platform, chat_id, thread_id) tuples are collapsed by the
     existing dedup pass.
     """
+    # Durable-outbox retries persist an already-resolved concrete target so a
+    # multi-target fan-out never resends to targets that succeeded previously.
+    # This is an internal scheduler field, not user-controlled routing syntax.
+    override = job.get("_delivery_targets_override")
+    if isinstance(override, list):
+        targets = []
+        seen = set()
+        for raw in override:
+            if not isinstance(raw, dict):
+                continue
+            platform_name = str(raw.get("platform") or "").strip().lower()
+            chat_id = str(raw.get("chat_id") or "").strip()
+            thread_id = raw.get("thread_id")
+            if (
+                not platform_name
+                or not chat_id
+                or not _is_registered_explicit_delivery_platform(platform_name)
+            ):
+                continue
+            target = {
+                "platform": platform_name,
+                "chat_id": chat_id,
+                "thread_id": str(thread_id) if thread_id is not None else None,
+            }
+            key = (target["platform"], target["chat_id"], target["thread_id"])
+            if key not in seen:
+                seen.add(key)
+                targets.append(target)
+        return targets
+
     deliver = _normalize_deliver_value(job.get("deliver", "local"))
     if deliver == "local":
         return []
@@ -1180,7 +1304,7 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
+) -> MediaDeliveryReport:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
@@ -1194,41 +1318,82 @@ def _send_media_via_adapter(
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     sent_names = []
-    for media_path, _is_voice in media_files:
+    report = MediaDeliveryReport()
+    for index, (media_path, _is_voice) in enumerate(media_files):
+        media_name = Path(media_path).name
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
+                media_kind = "audio"
                 coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
             elif ext in _VIDEO_EXTS:
+                media_kind = "video"
                 coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
             elif ext in _IMAGE_EXTS:
+                media_kind = "image"
                 coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
             else:
+                media_kind = "document"
                 coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
 
             from agent.async_utils import safe_schedule_threadsafe
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
-                logger.warning(
-                    "Job '%s': cannot send media %s, gateway loop unavailable",
-                    job.get("id", "?"), media_path,
+                msg = (
+                    f"media send {index + 1} ({media_name}) was not scheduled; "
+                    "gateway loop unavailable"
                 )
-                return
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                report.errors.append(msg)
+                continue
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
+                # ``safe_schedule_threadsafe`` returns the Future from
+                # ``asyncio.run_coroutine_threadsafe``.  Its ``cancel()``
+                # return value does *not* prove the coroutine never started:
+                # cancellation can be accepted while the asyncio Task is
+                # already running (and potentially after a network write).
+                # Request cancellation only as cleanup; every timeout after
+                # successful scheduling is therefore ambiguous.
                 future.cancel()
-                raise
-            if result and not getattr(result, "success", True):
-                logger.warning(
-                    "Job '%s': media send failed for %s: %s",
-                    job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
+                report.errors.append(
+                    f"media send {index + 1} ({media_name}) timed out after scheduling; "
+                    "delivery outcome is unknown"
                 )
+                raise
+            if isinstance(result, dict):
+                send_success = result.get("success") is True
+                message_id = result.get("message_id")
+                send_error = result.get("error")
             else:
-                sent_names.append(Path(media_path).name)
+                send_success = getattr(result, "success", None) is True
+                message_id = getattr(result, "message_id", None)
+                send_error = getattr(result, "error", None)
+            if not send_success:
+                msg = (
+                    f"media send {index + 1} ({media_name}) returned no explicit "
+                    f"success acknowledgement: {send_error or 'unconfirmed result'}"
+                )
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                report.errors.append(msg)
+            else:
+                sent_names.append(media_name)
+                report.receipts.append(
+                    {
+                        "kind": media_kind,
+                        "index": index,
+                        "message_id": str(message_id) if message_id else None,
+                    }
+                )
         except Exception as e:
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+            if not report.errors or media_name not in report.errors[-1]:
+                report.errors.append(
+                    f"media send {index + 1} ({media_name}) failed after dispatch; "
+                    "delivery outcome is unknown"
+                )
 
     # Record a stub turn for delivered attachments — they reach the user's
     # chat as native media with no transcript trace otherwise, so a reply
@@ -1254,6 +1419,7 @@ def _send_media_via_adapter(
                 "Job '%s': failed to record media stub", job.get("id", "?"),
                 exc_info=True,
             )
+    return report
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -1333,7 +1499,14 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    return_report: bool = False,
+) -> Optional[str] | DeliveryReport:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1345,10 +1518,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     Returns None on success, or an error string on failure.
     """
     targets = _resolve_delivery_targets(job)
+    report = DeliveryReport()
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
-            return None  # local-only jobs don't deliver — not a failure
+            return report if return_report else None  # local-only — not a failure
         # deliver=origin with no resolvable origin and no configured home
         # channels: treat as local rather than reporting an error.  CLI-created
         # jobs never capture a {platform, chat_id} origin, so failing here would
@@ -1361,10 +1535,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 "skipping delivery (output saved in last_output)",
                 job.get("name", job.get("id", "?")),
             )
-            return None
+            return report if return_report else None
         msg = f"no delivery target resolved for deliver={deliver_value}"
         logger.warning("Job '%s': %s", job["id"], msg)
-        return msg
+        report.error = msg
+        return report if return_report else msg
 
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
@@ -1416,7 +1591,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception as e:
         msg = f"failed to load gateway config: {e}"
         logger.error("Job '%s': %s", job["id"], msg)
-        return msg
+        report.error = msg
+        return report if return_report else msg
 
     delivery_errors = []
     # Write-ahead outbound records for this delivery, one per non-mirrored
@@ -1429,6 +1605,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        target_key = {
+            "platform": platform_name,
+            "chat_id": str(chat_id),
+            "thread_id": str(thread_id) if thread_id is not None else None,
+        }
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -1463,6 +1644,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             msg = f"unknown platform '{platform_name}'"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
+            report.failed.append({**target_key, "error": msg})
             continue
 
         pconfig = config.platforms.get(platform)
@@ -1470,12 +1652,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
+            report.failed.append({**target_key, "error": msg})
             continue
 
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
+        target_ambiguous = False
         target_errors = []
 
         # Write-ahead record: put this delivery in the target chat's session
@@ -1486,7 +1670,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # the fallback for those, unchanged). oob_state["done"] flips when a
         # success path resolves the record; unresolved records are marked
         # failed after the loop.
-        oob_state = {"handle": None, "done": False, "errors": target_errors}
+        oob_state = {
+            "handle": None,
+            "done": False,
+            "ambiguous": False,
+            "errors": target_errors,
+        }
         if not mirror_this_target and cleaned_delivery_content.strip():
             from gateway.outbound_memory import begin_outbound_record
             oob_state["handle"] = begin_outbound_record(
@@ -1645,6 +1834,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 adapter_ok = True
                 timed_out = False
                 live_pmid = None  # platform message id from a confirmed live send
+                live_send_receipts: list[dict[str, Any]] = []
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
@@ -1677,46 +1867,30 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         try:
                             send_result = future.result(timeout=60)
                         except TimeoutError:
-                            # #38922: a slow confirmation does NOT necessarily
-                            # mean the send failed — but we must distinguish two
-                            # cases via future.cancel()'s return value:
-                            #
-                            #   cancel() == False -> the coroutine was already
-                            #     running on the gateway loop when the timeout
-                            #     fired; the request is in flight on the wire and
-                            #     cannot be un-sent.  Re-sending via standalone
-                            #     would be a guaranteed DUPLICATE, so treat it as
-                            #     delivered (assume-delivered).
-                            #
-                            #   cancel() == True -> the scheduled callback never
-                            #     started executing (loop wedged/backlogged for
-                            #     the full 60s), so nothing was sent.  We MUST
-                            #     fall through to the standalone path or the
-                            #     message is silently dropped (worse than a
-                            #     duplicate).
-                            cancelled = future.cancel()
-                            if cancelled:
-                                msg = (
-                                    f"live adapter send to {platform_name}:{chat_id} "
-                                    "timed out before the coroutine was dispatched"
-                                )
-                                logger.warning(
-                                    "Job '%s': %s, falling back to standalone",
-                                    job["id"], msg,
-                                )
-                                target_errors.append(msg)
-                                adapter_ok = False  # fall through to standalone path
-                                timeout_handled = True
-                            else:
-                                timed_out = True
-                                timeout_handled = True
-                                logger.warning(
-                                    "Job '%s': live adapter send to %s:%s timed out "
-                                    "after 60s; already dispatched (in flight), "
-                                    "assuming delivered (skipping standalone fallback "
-                                    "to avoid duplicate)",
-                                    job["id"], platform_name, chat_id,
-                                )
+                            # Once run_coroutine_threadsafe accepted the
+                            # coroutine, timeout is always ambiguous.  The
+                            # concurrent Future can return True from cancel()
+                            # even after the asyncio Task started, so that
+                            # boolean cannot authorize a standalone resend.
+                            # Cancellation is best-effort cleanup only.
+                            future.cancel()
+                            timed_out = True
+                            target_ambiguous = True
+                            oob_state["ambiguous"] = True
+                            adapter_ok = False
+                            timeout_handled = True
+                            msg = (
+                                f"live adapter send to {platform_name}:{chat_id} "
+                                "timed out after scheduling; delivery outcome is unknown"
+                            )
+                            target_errors.append(msg)
+                            logger.warning(
+                                "Job '%s': live adapter send to %s:%s timed out "
+                                "after 60s; scheduling was accepted, so the outcome "
+                                "is ambiguous. Skipping standalone fallback to avoid "
+                                "a duplicate",
+                                job["id"], platform_name, chat_id,
+                            )
                         except Exception as ex:
                             # A real send error (not a slow confirmation) — fall
                             # through to the standalone path so the message is
@@ -1726,9 +1900,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
                         if timeout_handled:
                             # The timeout branch above already decided the
-                            # outcome (assume-delivered if in flight, or
-                            # adapter_ok=False to fall through if never
-                            # dispatched).  send_result is None, so skip the
+                            # outcome (ambiguous if in flight, or a standalone
+                            # fallback if never dispatched). send_result is None,
+                            # so skip the
                             # confirmation/thread-fallback inspection below.
                             pass
                         else:
@@ -1740,7 +1914,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             # misread a dict, and so a None / success-less object
                             # is NOT counted as delivered (#47056).
                             if isinstance(send_result, dict):
-                                send_success = bool(send_result.get("success", False))
+                                send_success = (
+                                    send_result.get("success") is True
+                                    and send_result.get("delivered", True) is not False
+                                )
                                 send_raw_response = send_result.get("raw_response")
                                 if send_success:
                                     live_pmid = send_result.get("message_id")
@@ -1770,7 +1947,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 )
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
-                            elif (
+                            else:
+                                live_send_receipts.append(
+                                    {
+                                        "kind": "text",
+                                        "index": 0,
+                                        "message_id": (
+                                            str(live_pmid) if live_pmid else None
+                                        ),
+                                    }
+                                )
+                            if send_success and (
                                 send_raw_response
                                 and thread_id
                                 and send_raw_response.get("thread_fallback")
@@ -1789,11 +1976,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # the General lane for private DM topics).  Skip on an in-flight
                 # confirmation timeout: the gateway loop is contended, so each
                 # media send would also block its 30s budget, and the text
-                # payload is already assumed delivered (#38922).  Record the
+                # payload is already quarantined as ambiguous. Record the
                 # skipped attachments so the drop is visible rather than silently
                 # lost.
                 if adapter_ok and not timed_out and media_files:
-                    _send_media_via_adapter(
+                    media_report = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -1802,6 +1989,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         job,
                         platform=platform,
                     )
+                    live_send_receipts.extend(media_report.receipts)
+                    if media_report.errors:
+                        target_errors.extend(media_report.errors)
+                        target_ambiguous = True
+                        oob_state["ambiguous"] = True
+                        adapter_ok = False
                 elif timed_out and media_files:
                     msg = (
                         f"{len(media_files)} media attachment(s) not delivered to "
@@ -1810,7 +2003,49 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     logger.warning("Job '%s': %s", job["id"], msg)
                     delivery_errors.append(msg)
 
+                if adapter_ok and not live_send_receipts:
+                    msg = (
+                        f"live adapter produced no per-send acknowledgement for "
+                        f"{platform_name}:{chat_id}; delivery outcome is unknown"
+                    )
+                    target_errors.append(msg)
+                    target_ambiguous = True
+                    oob_state["ambiguous"] = True
+                    adapter_ok = False
+
+                require_message_ids = (
+                    str(job.get("delivery_confirmation") or "adapter_ack")
+                    == "message_id"
+                )
+                if adapter_ok and require_message_ids:
+                    missing_ids = [
+                        item for item in live_send_receipts
+                        if not item.get("message_id")
+                    ]
+                    if missing_ids:
+                        msg = (
+                            f"live adapter acknowledged {len(missing_ids)} of "
+                            f"{len(live_send_receipts)} send(s) to "
+                            f"{platform_name}:{chat_id} without a platform message id "
+                            "for each send as required by this job"
+                        )
+                        target_errors.append(msg)
+                        target_ambiguous = True
+                        oob_state["ambiguous"] = True
+                        adapter_ok = False
+
                 if adapter_ok:
+                    live_message_ids = [
+                        str(item["message_id"])
+                        for item in live_send_receipts
+                        if item.get("message_id")
+                    ]
+                    primary_message_id = (
+                        live_message_ids[0] if live_message_ids else None
+                    )
+                    all_sends_have_ids = (
+                        len(live_message_ids) == len(live_send_receipts)
+                    )
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
                     # Seed the thread session only now that delivery into it
@@ -1856,7 +2091,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         if oob_state["handle"] is not None:
                             finish_outbound_record(
                                 oob_state["handle"], True,
-                                platform_message_id=live_pmid,
+                                platform_message_id=primary_message_id,
                             )
                         elif cleaned_delivery_content.strip():
                             record_outbound(
@@ -1865,19 +2100,33 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 cleaned_delivery_content.strip(),
                                 origin=f"cron job '{job.get('name') or job['id']}'",
                                 thread_id=thread_id,
-                                platform_message_id=live_pmid,
+                                platform_message_id=primary_message_id,
                             )
                     oob_state["done"] = True
+                    report.receipts.append({
+                        **target_key,
+                        "message_id": primary_message_id,
+                        "message_ids": live_message_ids,
+                        "send_receipts": live_send_receipts,
+                        "confirmation": (
+                            "platform_message_id"
+                            if all_sends_have_ids
+                            else "adapter_ack"
+                        ),
+                    })
             except Exception as e:
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
+                target_ambiguous = True
+                oob_state["ambiguous"] = True
                 logger.warning(
-                    "Job '%s': %s, falling back to standalone",
+                    "Job '%s': %s; outcome may be on the wire, quarantining "
+                    "without standalone fallback to avoid a duplicate",
                     job["id"], err_msg,
                 )
 
-        if not delivered:
+        if not delivered and not target_ambiguous:
             # If the interpreter is finalizing (gateway SIGTERM / restart /
             # OOM), scheduling any new delivery is futile — asyncio.run and a
             # fresh ThreadPoolExecutor both raise "cannot schedule new futures
@@ -1937,20 +2186,130 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                     target_errors.extend([msg])
                     delivery_errors.extend(target_errors)
+                    target_ambiguous = True
+                    oob_state["ambiguous"] = True
+                    report.ambiguous.append({**target_key, "error": msg})
                     continue
             except Exception as e:
+                # If asyncio.run itself failed before taking ownership (for
+                # example a patched/closing runtime), close the coroutine so
+                # the ambiguous-path quarantine does not also leak a
+                # "coroutine was never awaited" warning.
+                try:
+                    coro.close()
+                except Exception:
+                    pass
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
+                target_ambiguous = True
+                oob_state["ambiguous"] = True
+                report.ambiguous.append({**target_key, "error": msg})
                 continue
 
-            if result and result.get("error"):
-                msg = f"delivery error: {result['error']}"
+            if not isinstance(result, dict):
+                msg = (
+                    f"delivery to {platform_name}:{chat_id} returned no explicit "
+                    "acknowledgement; delivery outcome is unknown"
+                )
+                logger.error("Job '%s': %s", job["id"], msg)
+                target_errors.append(msg)
+                delivery_errors.extend(target_errors)
+                target_ambiguous = True
+                oob_state["ambiguous"] = True
+                report.ambiguous.append({**target_key, "error": msg})
+                continue
+
+            if result.get("success") is not True:
+                msg = f"delivery error: {result.get('error') or 'unconfirmed result'}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
+                # Standalone transports frequently collapse timeouts and
+                # post-dispatch connection failures into a plain {"error":
+                # ...}. Retrying such an error can duplicate a message the
+                # platform already accepted. Only a transport that explicitly
+                # proves no send occurred may opt into automatic retry.
+                if result.get("delivery_outcome") != "definite_failure":
+                    target_ambiguous = True
+                    oob_state["ambiguous"] = True
+                    report.ambiguous.append({**target_key, "error": msg})
                 continue
+
+            require_message_ids = (
+                str(job.get("delivery_confirmation") or "adapter_ack")
+                == "message_id"
+            )
+            standalone_send_receipts: list[dict[str, Any]] = []
+            if media_files and require_message_ids:
+                raw_receipts = result.get("send_receipts")
+                receipts_proven = (
+                    result.get("all_sends_confirmed") is True
+                    and isinstance(raw_receipts, list)
+                    and bool(raw_receipts)
+                    and all(
+                        isinstance(item, dict)
+                        and item.get("success") is True
+                        and bool(item.get("message_id"))
+                        for item in raw_receipts
+                    )
+                )
+                if not receipts_proven:
+                    msg = (
+                        f"standalone sender for {platform_name}:{chat_id} did not "
+                        "provide per-send success receipts and platform message ids "
+                        "for mixed/media delivery; delivery outcome is unknown"
+                    )
+                    logger.error("Job '%s': %s", job["id"], msg)
+                    target_errors.append(msg)
+                    delivery_errors.extend(target_errors)
+                    target_ambiguous = True
+                    oob_state["ambiguous"] = True
+                    report.ambiguous.append({**target_key, "error": msg})
+                    continue
+                standalone_send_receipts = [
+                    {
+                        "kind": str(item.get("kind") or "media"),
+                        "index": index,
+                        "message_id": str(item["message_id"]),
+                    }
+                    for index, item in enumerate(raw_receipts)
+                ]
+
+            _result_pmid = result.get("message_id")
+            if require_message_ids and not media_files and not _result_pmid:
+                msg = (
+                    f"standalone sender acknowledged {platform_name}:{chat_id} "
+                    "without a platform message id required by this job"
+                )
+                logger.error("Job '%s': %s", job["id"], msg)
+                target_errors.append(msg)
+                delivery_errors.extend(target_errors)
+                target_ambiguous = True
+                oob_state["ambiguous"] = True
+                report.ambiguous.append({**target_key, "error": msg})
+                continue
+
+            if not standalone_send_receipts:
+                standalone_send_receipts = [
+                    {
+                        "kind": "aggregate" if media_files else "text",
+                        "index": 0,
+                        "message_id": str(_result_pmid) if _result_pmid else None,
+                    }
+                ]
+            standalone_message_ids = [
+                str(item["message_id"])
+                for item in standalone_send_receipts
+                if item.get("message_id")
+            ]
+            primary_standalone_message_id = (
+                standalone_message_ids[0] if standalone_message_ids else None
+            )
+            all_standalone_sends_have_ids = (
+                len(standalone_message_ids) == len(standalone_send_receipts)
+            )
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
             _maybe_mirror_cron_delivery(
@@ -1969,13 +2328,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     finish_outbound_record,
                     record_outbound,
                 )
-                _standalone_pmid = (
-                    result.get("message_id") if isinstance(result, dict) else None
-                )
                 if oob_state["handle"] is not None:
                     finish_outbound_record(
                         oob_state["handle"], True,
-                        platform_message_id=_standalone_pmid,
+                        platform_message_id=primary_standalone_message_id,
                     )
                 elif cleaned_delivery_content.strip():
                     record_outbound(
@@ -1984,9 +2340,26 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         cleaned_delivery_content.strip(),
                         origin=f"cron job '{job.get('name') or job['id']}'",
                         thread_id=thread_id,
-                        platform_message_id=_standalone_pmid,
+                        platform_message_id=primary_standalone_message_id,
                     )
             oob_state["done"] = True
+            report.receipts.append({
+                **target_key,
+                "message_id": primary_standalone_message_id,
+                "message_ids": standalone_message_ids,
+                "send_receipts": standalone_send_receipts,
+                "confirmation": (
+                    "platform_message_id"
+                    if all_standalone_sends_have_ids
+                    else "standalone_ack"
+                ),
+            })
+
+        if target_ambiguous:
+            report.ambiguous.append({
+                **target_key,
+                "error": "; ".join(target_errors) or "delivery outcome unknown",
+            })
 
     # Resolve write-ahead records for targets whose every send attempt
     # failed: the transcript keeps the message (write-ahead already put it
@@ -1998,11 +2371,37 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             finish_outbound_record(
                 _st["handle"], False,
                 error="; ".join(_st["errors"]) or "delivery failed",
+                ambiguous=bool(_st.get("ambiguous")),
             )
 
-    if delivery_errors:
-        return "; ".join(delivery_errors)
-    return None
+    resolved_keys = {
+        (item.get("platform"), item.get("chat_id"), item.get("thread_id"))
+        for item in (report.receipts + report.ambiguous + report.failed)
+    }
+    aggregate_error = "; ".join(delivery_errors) if delivery_errors else None
+    for target in targets:
+        key = (
+            str(target.get("platform") or ""),
+            str(target.get("chat_id") or ""),
+            str(target.get("thread_id")) if target.get("thread_id") is not None else None,
+        )
+        if key in resolved_keys:
+            continue
+        report.failed.append({
+            "platform": key[0],
+            "chat_id": key[1],
+            "thread_id": key[2],
+            "error": aggregate_error or "delivery failed without confirmation",
+        })
+    if report.ambiguous and not aggregate_error:
+        aggregate_error = "; ".join(
+            str(item.get("error") or "delivery outcome unknown")
+            for item in report.ambiguous
+        )
+    report.error = aggregate_error
+    if return_report:
+        return report
+    return report.error
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
@@ -2043,7 +2442,13 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(
+    script_path: str,
+    *,
+    args: Optional[list[str]] = None,
+    extra_env: Optional[dict[str, str]] = None,
+    timeout_seconds: Optional[int] = None,
+) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -2069,6 +2474,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        args: Optional literal arguments for a delivery acknowledgement.
+        extra_env: Non-secret delivery receipt metadata for that acknowledgement.
+        timeout_seconds: Optional tighter bound for acknowledgement callbacks.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -2099,7 +2507,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
-    script_timeout = _get_script_timeout()
+    script_timeout = int(timeout_seconds or _get_script_timeout())
+    if script_timeout <= 0:
+        return False, "Blocked: cron script timeout must be positive"
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -2125,17 +2535,26 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     else:
         argv = [sys.executable, str(path)]
 
+    safe_args = []
+    for arg in args or []:
+        if not isinstance(arg, str) or len(arg) > 1000:
+            return False, "Blocked: invalid cron script argument"
+        safe_args.append(arg)
+    argv.extend(safe_args)
+
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
+        script_env = {"HERMES_DELIVERY_ACK_PROTOCOL": "1"}
+        script_env.update(extra_env or {})
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            env=_sanitize_subprocess_env(os.environ.copy(), extra_env=script_env),
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
@@ -2533,6 +2952,7 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    _delivery_ack_var.set(None)
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -2579,6 +2999,10 @@ def run_job(
                     os.chdir(_prior_cwd)
                 except OSError:
                     pass
+
+        output, delivery_ack = _extract_delivery_ack_directive(output)
+        if ok and delivery_ack is not None:
+            _delivery_ack_var.set(delivery_ack)
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2663,6 +3087,13 @@ def run_job(
     if script_path:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
+        if _ran_ok:
+            _script_output, delivery_ack = _extract_delivery_ack_directive(
+                _script_output
+            )
+            prerun_script = (_ran_ok, _script_output)
+            if delivery_ack is not None:
+                _delivery_ack_var.set(delivery_ack)
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -3378,6 +3809,154 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def _run_outbox_ack(
+    delivery_id: str,
+    job: Optional[dict[str, Any]] = None,
+    ack: Optional[dict[str, Any]] = None,
+    receipt: Optional[dict[str, Any]] = None,
+) -> None:
+    """Claim and run one idempotent ACK after receipt-backed delivery."""
+    from cron import delivery_outbox
+
+    claimed = delivery_outbox.claim_ack(delivery_id)
+    if claimed is None:
+        return
+    # Persisted outbox data is authoritative. Optional arguments remain in the
+    # signature for compatibility with older internal/test callers, but cannot
+    # substitute a different script, token, or receipt after the atomic claim.
+    job = claimed.job
+    ack = claimed.ack
+    receipt = claimed.receipt
+    if not ack:
+        delivery_outbox.mark_ack_retry(
+            delivery_id, "claimed source acknowledgement has no directive"
+        )
+        return
+    script_path = job.get("script")
+    if not script_path:
+        delivery_outbox.mark_ack_retry(
+            delivery_id, "delivery ack requested but the job has no script"
+        )
+        return
+    receipt = receipt or {}
+    extra_env = {
+        "HERMES_DELIVERY_ID": delivery_id,
+        "HERMES_DELIVERY_PLATFORM": str(receipt.get("platform") or ""),
+        "HERMES_DELIVERY_CHAT_ID": str(receipt.get("chat_id") or ""),
+        "HERMES_DELIVERY_MESSAGE_ID": str(receipt.get("message_id") or ""),
+        "HERMES_DELIVERY_CONFIRMATION": "confirmed",
+        "HERMES_DELIVERY_CONFIRMATION_LEVEL": str(
+            receipt.get("confirmation") or "adapter_ack"
+        ),
+    }
+    ok, output = _run_job_script(
+        str(script_path),
+        args=list(ack.get("args") or []),
+        extra_env=extra_env,
+        timeout_seconds=120,
+    )
+    if ok:
+        state = delivery_outbox.mark_acked(delivery_id)
+        if state == "delivered":
+            logger.info(
+                "Cron delivery %s source acknowledgement succeeded", delivery_id
+            )
+        else:
+            logger.warning(
+                "Cron delivery %s ACK completed after state changed to %s; "
+                "late completion was ignored",
+                delivery_id,
+                state,
+            )
+    else:
+        state = delivery_outbox.mark_ack_retry(delivery_id, output)
+        logger.error(
+            "Cron delivery %s source acknowledgement failed (state=%s): %s",
+            delivery_id,
+            state,
+            output,
+        )
+
+
+def _attempt_outbox_delivery(record, *, adapters=None, loop=None) -> DeliveryReport:
+    """Claim and attempt one persisted delivery without re-running its job."""
+    from cron import delivery_outbox
+
+    claimed = delivery_outbox.claim(record.delivery_id)
+    if claimed is None:
+        return DeliveryReport(error="delivery was not claimable")
+    report = _deliver_result(
+        claimed.job,
+        claimed.content,
+        adapters=adapters,
+        loop=loop,
+        return_report=True,
+    )
+    assert isinstance(report, DeliveryReport)
+    if report.confirmed:
+        receipt = report.receipts[0]
+        state = delivery_outbox.mark_confirmed(claimed.delivery_id, receipt)
+        if state in {"delivered", "ack_pending"}:
+            mark_job_delivery(claimed.job_id, "confirmed", None)
+        else:
+            logger.warning(
+                "Cron delivery %s confirmed after state changed to %s; "
+                "late receipt was ignored",
+                claimed.delivery_id,
+                state,
+            )
+        if state == "ack_pending":
+            _run_outbox_ack(
+                claimed.delivery_id, claimed.job, claimed.ack, receipt
+            )
+    elif report.ambiguous:
+        ambiguous_error = (
+            report.error or "delivery started but no acknowledgement arrived"
+        )
+        state = delivery_outbox.mark_ambiguous(
+            claimed.delivery_id,
+            ambiguous_error,
+        )
+        if state == "ambiguous":
+            mark_job_delivery(claimed.job_id, "ambiguous", ambiguous_error)
+    else:
+        retry_error = report.error or "platform did not confirm delivery"
+        state = delivery_outbox.mark_retry(
+            claimed.delivery_id,
+            retry_error,
+        )
+        if state in {"retry_wait", "dead"}:
+            mark_job_delivery(claimed.job_id, state, retry_error)
+    return report
+
+
+def retry_delivery_outbox(*, adapters=None, loop=None, limit: int = 20) -> int:
+    """Retry definite send failures and confirmed-delivery source acks.
+
+    Ambiguous rows are deliberately excluded: they require platform read-back
+    or operator reconciliation before resend, which is the only safe way to
+    avoid duplicate messages after a process crash/in-flight timeout.
+    """
+    from cron import delivery_outbox
+
+    recovered = delivery_outbox.recover_interrupted()
+    if recovered:
+        logger.warning(
+            "Recovered %d interrupted cron delivery/source-ack attempt(s)",
+            recovered,
+        )
+    processed = 0
+    for record in delivery_outbox.due(limit=limit):
+        _attempt_outbox_delivery(record, adapters=adapters, loop=loop)
+        processed += 1
+    for record in delivery_outbox.due_acks(limit=limit):
+        _run_outbox_ack(
+            record.delivery_id, record.job, record.ack, record.receipt
+        )
+        processed += 1
+    return processed
+
+
 def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -3436,6 +4015,14 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success, output, final_response, error = run_job(
                 job, defer_agent_teardown=_deferred_agents
             )
+            delivery_ack = _delivery_ack_var.get()
+            _delivery_ack_var.set(None)
+            # A pre-run script may have armed an ACK before an LLM-backed job
+            # later fails. Delivering the generic cron-failure alert is useful,
+            # but it must never acknowledge the underlying source batch: the
+            # user did not receive the intended source-bearing result.
+            if not success:
+                delivery_ack = None
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -3455,6 +4042,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
         delivery_error = None
+        delivery_status = "not_attempted"
         try:
             output_file = save_job_output(job["id"], output)
             if verbose:
@@ -3480,9 +4068,80 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
             if should_deliver:
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    targets = _resolve_delivery_targets(job)
+                    if not targets:
+                        # Preserve local/deliver=origin-without-home semantics:
+                        # there is no external side effect to persist/retry.
+                        delivery_error = _deliver_result(
+                            job, deliver_content, adapters=adapters, loop=loop
+                        )
+                    else:
+                        from cron import delivery_outbox
+
+                        if delivery_ack and len(targets) != 1:
+                            logger.error(
+                                "Job '%s' requested a delivery ack with %d targets; "
+                                "refusing premature source ack until a fan-out "
+                                "coordinator is configured",
+                                job["id"],
+                                len(targets),
+                            )
+                            delivery_ack = None
+                        delivery_errors: list[str] = []
+                        target_statuses: list[str] = []
+                        for target in targets:
+                            record = delivery_outbox.enqueue(
+                                job,
+                                deliver_content,
+                                target,
+                                ack=delivery_ack,
+                            )
+                            delivery_status = "pending"
+                            report = _attempt_outbox_delivery(
+                                record, adapters=adapters, loop=loop
+                            )
+                            stored = delivery_outbox.get(record.delivery_id)
+                            stored_state = stored.state if stored is not None else "missing"
+                            if stored_state in {
+                                "delivered",
+                                "ack_pending",
+                                "ack_in_flight",
+                                "ack_retry",
+                                "ack_dead",
+                            }:
+                                target_statuses.append("confirmed")
+                            elif stored_state in {"ambiguous", "quarantined"}:
+                                target_statuses.append("ambiguous")
+                            else:
+                                target_statuses.append("pending")
+                            if not report.confirmed or stored_state not in {
+                                "delivered",
+                                "ack_pending",
+                                "ack_in_flight",
+                                "ack_retry",
+                                "ack_dead",
+                            }:
+                                delivery_errors.append(
+                                    report.error
+                                    or f"delivery ended in outbox state {stored_state}"
+                                )
+                        if target_statuses and all(
+                            status == "confirmed" for status in target_statuses
+                        ):
+                            delivery_status = "confirmed"
+                        elif "ambiguous" in target_statuses:
+                            delivery_status = "ambiguous"
+                        elif "confirmed" in target_statuses:
+                            delivery_status = "partial"
+                        elif target_statuses:
+                            delivery_status = "pending"
+                        delivery_error = (
+                            "; ".join(delivery_errors) if delivery_errors else None
+                        )
                 except Exception as de:
                     delivery_error = str(de)
+                    if delivery_status != "not_attempted":
+                        delivery_status = "ambiguous"
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
@@ -3498,12 +4157,23 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        mark_job_run(
+            job["id"],
+            success,
+            error,
+            delivery_error=delivery_error,
+            delivery_status=delivery_status,
+        )
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        mark_job_run(job["id"], False, str(e))
+        mark_job_run(
+            job["id"],
+            False,
+            str(e),
+            delivery_status="not_attempted",
+        )
         return False
 
 
@@ -3558,6 +4228,12 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         return 0
 
     try:
+        # Bound recovery work so a platform outage cannot make a large backlog
+        # monopolize the ticker and delay newly-due P0 jobs.
+        retried = retry_delivery_outbox(adapters=adapters, loop=loop, limit=3)
+        if retried and verbose:
+            logger.info("Processed %d pending cron delivery/ack retry item(s)", retried)
+
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:

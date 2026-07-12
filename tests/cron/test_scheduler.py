@@ -828,6 +828,180 @@ class TestDeliverResultWrapping:
         # Audio should still be delivered as a voice bubble
         adapter.send_voice.assert_called_once()
 
+    def test_message_id_media_only_without_id_is_ambiguous(self, tmp_path, monkeypatch):
+        """Strong confirmation cannot treat a media ACK without an ID as delivered."""
+        import asyncio as _asyncio
+        from concurrent.futures import Future
+
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "canary.png")
+        adapter = AsyncMock()
+        adapter.send_image_file.return_value = SendResult(success=True, message_id="")
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(_asyncio.run(coro))
+            return future
+
+        standalone = AsyncMock(return_value={"success": True, "message_id": "fallback"})
+        job = {
+            "id": "media-only-strong",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "999"},
+            "delivery_confirmation": "message_id",
+        }
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone):
+            report = _deliver_result(
+                job,
+                f"MEDIA:{media_path}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+                return_report=True,
+            )
+
+        assert report.confirmed is False
+        assert report.ambiguous
+        assert "without a platform message id" in report.error
+        standalone.assert_not_awaited()
+
+    def test_message_id_mixed_delivery_requires_and_records_every_id(
+        self, tmp_path, monkeypatch
+    ):
+        import asyncio as _asyncio
+        from concurrent.futures import Future
+
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "proof.png")
+        adapter = AsyncMock()
+        adapter.send.return_value = SendResult(success=True, message_id="text-1")
+        adapter.send_image_file.return_value = SendResult(
+            success=True, message_id="image-1"
+        )
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(_asyncio.run(coro))
+            return future
+
+        job = {
+            "id": "mixed-strong",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "999"},
+            "delivery_confirmation": "message_id",
+        }
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            report = _deliver_result(
+                job,
+                f"Proof\nMEDIA:{media_path}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+                return_report=True,
+            )
+
+        assert report.confirmed is True
+        assert report.receipts[0]["message_id"] == "text-1"
+        assert report.receipts[0]["message_ids"] == ["text-1", "image-1"]
+        assert report.receipts[0]["confirmation"] == "platform_message_id"
+
+    def test_mixed_media_failure_is_ambiguous_without_whole_message_retry(
+        self, tmp_path, monkeypatch
+    ):
+        import asyncio as _asyncio
+        from concurrent.futures import Future
+
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "failed.png")
+        adapter = AsyncMock()
+        adapter.send.return_value = SendResult(success=True, message_id="text-sent")
+        adapter.send_image_file.return_value = SendResult(
+            success=False, error="media rejected"
+        )
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(_asyncio.run(coro))
+            return future
+
+        standalone = AsyncMock(return_value={"success": True, "message_id": "duplicate"})
+        job = {
+            "id": "mixed-partial",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "999"},
+            "delivery_confirmation": "message_id",
+        }
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone):
+            report = _deliver_result(
+                job,
+                f"Text sent\nMEDIA:{media_path}",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+                return_report=True,
+            )
+
+        assert report.confirmed is False
+        assert report.ambiguous
+        standalone.assert_not_awaited()
+
+    def test_standalone_strong_media_requires_per_send_receipts(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.config import Platform
+
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "opaque.png")
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        standalone = AsyncMock(
+            return_value={"success": True, "message_id": "only-last-id"}
+        )
+        job = {
+            "id": "standalone-media-strong",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "999"},
+            "delivery_confirmation": "message_id",
+        }
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone):
+            report = _deliver_result(
+                job,
+                f"Caption\nMEDIA:{media_path}",
+                return_report=True,
+            )
+
+        assert report.confirmed is False
+        assert report.ambiguous
+        assert "per-send success receipts" in report.error
+
     def test_live_adapter_sends_cleaned_text_not_raw(self):
         """The live adapter path must send cleaned text (MEDIA tags stripped),
         not the raw delivery_content with embedded MEDIA: tags."""
@@ -2568,6 +2742,7 @@ class TestSilentDelivery:
             False,
             "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
             delivery_error=None,
+            delivery_status="not_attempted",
         )
 
 
@@ -3114,19 +3289,56 @@ class TestParallelTick:
 
 class TestDeliverResultTimeoutCancelsFuture:
     """When future.result(timeout=60) raises TimeoutError in the live adapter
-    delivery path, the outcome depends on whether the coroutine was already
-    running.  future.cancel() returning False means it is in flight on the wire
-    (cannot be un-sent) → treat as DELIVERED and skip the standalone fallback to
-    avoid a duplicate (#38922).  future.cancel() returning True means it never
-    started (wedged loop) → nothing was sent, so fall through to standalone or
-    the message is silently dropped.  Regression for #38922.
+    delivery path, the outcome is ambiguous once run_coroutine_threadsafe has
+    accepted the coroutine. Its concurrent Future may accept cancellation even
+    after the asyncio Task started, so cancel() is cleanup, never proof that a
+    standalone resend is safe. Regression for #38922.
     """
 
-    def test_live_adapter_timeout_assumes_delivered_no_duplicate(self):
+    @staticmethod
+    def _standalone_error_report(result):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        job = {
+            "id": "standalone-outcome-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new=AsyncMock(return_value=result),
+             ):
+            return _deliver_result(job, "Hello", return_report=True)
+
+    def test_standalone_unclassified_error_is_ambiguous_not_retryable(self):
+        report = self._standalone_error_report(
+            {"error": "Telegram send failed: request timed out"}
+        )
+        assert report.confirmed is False
+        assert report.ambiguous
+        assert report.failed == []
+
+    def test_standalone_explicit_definite_failure_remains_retryable(self):
+        report = self._standalone_error_report(
+            {
+                "error": "recipient rejected before dispatch",
+                "delivery_outcome": "definite_failure",
+            }
+        )
+        assert report.confirmed is False
+        assert report.ambiguous == []
+        assert report.failed
+
+    def test_live_adapter_timeout_is_ambiguous_and_not_duplicated(self):
         """End-to-end: live adapter confirmation times out past the 60s budget.
-        The fix (#38922) treats the send as already-dispatched/delivered and
-        does NOT run the standalone fallback — otherwise the message is sent
-        twice."""
+        An already-dispatched send is not safe to call delivered without an
+        acknowledgement, but it is also not safe to resend.  Report it as
+        ambiguous and do NOT run the standalone fallback."""
         from gateway.config import Platform
         from concurrent.futures import Future
 
@@ -3178,49 +3390,107 @@ class TestDeliverResultTimeoutCancelsFuture:
                 "Hello world",
                 adapters={Platform.TELEGRAM: adapter},
                 loop=loop,
+                return_report=True,
             )
 
         # 1. cancel() was attempted (returned False = in flight).
         assert cancel_calls == [True], "future.cancel() should be attempted on TimeoutError"
-        # 2. Delivery is reported successful (no error string returned).
-        assert result is None, f"expected successful delivery, got error: {result!r}"
-        # 3. The standalone fallback must NOT run — that is the #38922 fix:
-        #    an in-flight confirmation timeout is assume-delivered, not a resend.
+        # 2. Delivery is explicitly unresolved rather than falsely successful.
+        assert result.confirmed is False
+        assert result.ambiguous
+        assert "outcome is unknown" in result.error
+        # 3. The standalone fallback must NOT run — an in-flight confirmation
+        #    timeout is ambiguous, not permission to resend.
         standalone_send.assert_not_awaited()
 
-    def test_live_adapter_timeout_before_dispatch_falls_back_to_standalone(self):
-        """When the coroutine never started (loop wedged) — future.cancel()
-        returns True — nothing was sent, so _deliver_result MUST fall through
-        to the standalone path rather than silently dropping the message.
-        This is the inverse of the assume-delivered case and guards against the
-        wedged-loop silent drop."""
-        from gateway.config import Platform
+    def test_message_id_canary_fails_closed_on_ack_without_id(self):
+        """A canary/source-ack job can require the strongest available receipt."""
         from concurrent.futures import Future
 
-        adapter = AsyncMock()
-        adapter.send.return_value = MagicMock(success=True)
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
 
-        pconfig = MagicMock()
-        pconfig.enabled = True
+        adapter = AsyncMock()
+        pconfig = MagicMock(enabled=True)
         mock_cfg = MagicMock()
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
-
         loop = MagicMock()
         loop.is_running.return_value = True
-
-        captured_future = Future()
-        cancel_calls = []
-
-        def never_dispatched_cancel():
-            cancel_calls.append(True)
-            return True  # callback never ran — successfully cancelled
-
-        captured_future.cancel = never_dispatched_cancel
-        captured_future.result = MagicMock(side_effect=TimeoutError("timed out"))
+        future = Future()
+        future.set_result(SendResult(success=True, message_id=None))
 
         def fake_run_coro(coro, _loop):
             coro.close()
-            return captured_future
+            return future
+
+        standalone_send = AsyncMock(return_value={"success": True, "message_id": "fallback"})
+        job = {
+            "id": "canary-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+            "delivery_confirmation": "message_id",
+        }
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            report = _deliver_result(
+                job,
+                "canary",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+                return_report=True,
+            )
+
+        assert report.confirmed is False
+        assert report.ambiguous
+        assert "without a platform message id" in report.error
+        standalone_send.assert_not_awaited()
+
+    def test_started_coroutine_cancel_true_is_ambiguous_without_fallback(self):
+        """A started run_coroutine_threadsafe task can still accept cancel().
+
+        Prove that runtime behavior with a real event loop, then ensure the
+        scheduler treats the timeout as ambiguous and never invokes the
+        standalone sender even though cancel() returned True.
+        """
+        import asyncio
+        import threading
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+        started = threading.Event()
+        actual_future = None
+        cancel_results = []
+
+        async def started_send(*_args, **_kwargs):
+            started.set()
+            await asyncio.sleep(3600)
+
+        class _ImmediateTimeoutProxy:
+            def __init__(self, future):
+                self._future = future
+
+            def result(self, timeout=None):
+                raise TimeoutError("synthetic confirmation timeout")
+
+            def cancel(self):
+                result = self._future.cancel()
+                cancel_results.append(result)
+                return result
+
+        def schedule_started(coro, target_loop, **_kwargs):
+            nonlocal actual_future
+            actual_future = asyncio.run_coroutine_threadsafe(coro, target_loop)
+            assert started.wait(2), "delivery coroutine never started"
+            return _ImmediateTimeoutProxy(actual_future)
 
         job = {
             "id": "timeout-undispatched-job",
@@ -3229,29 +3499,38 @@ class TestDeliverResultTimeoutCancelsFuture:
         }
 
         standalone_send = AsyncMock(return_value={"success": True})
+        try:
+            with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+                 patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+                 patch("gateway.delivery.DeliveryRouter._deliver_to_platform", new=started_send), \
+                 patch("agent.async_utils.safe_schedule_threadsafe", side_effect=schedule_started), \
+                 patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+                report = _deliver_result(
+                    job,
+                    "Hello world",
+                    adapters={Platform.TELEGRAM: adapter},
+                    loop=loop,
+                    return_report=True,
+                )
+        finally:
+            if actual_future is not None and not actual_future.done():
+                actual_future.cancel()
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=2)
+            loop.close()
 
-        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
-             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
-             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
-            result = _deliver_result(
-                job,
-                "Hello world",
-                adapters={Platform.TELEGRAM: adapter},
-                loop=loop,
-            )
+        assert started.is_set()
+        assert cancel_results == [True], (
+            "the regression requires a started task whose Future accepts cancellation"
+        )
+        standalone_send.assert_not_awaited()
+        assert report.confirmed is False
+        assert report.ambiguous
+        assert "outcome is unknown" in report.error
 
-        assert cancel_calls == [True], "future.cancel() should be attempted"
-        # The standalone path MUST run — the message was never sent.
-        standalone_send.assert_awaited_once()
-        assert result is None, f"standalone should have delivered, got: {result!r}"
-
-    def test_live_adapter_real_exception_falls_back_to_standalone(self):
-        """A non-timeout send Exception (real failure, not a slow confirmation)
-        must fall through to the standalone path so the message is still
-        delivered.  Guards the `except Exception: raise` branch — the bug class
-        where broadening the timeout handler to swallow all exceptions would
-        silently drop messages."""
+    def test_live_adapter_real_exception_is_ambiguous_without_fallback(self):
+        """After dispatch, an exception cannot prove whether bytes reached the
+        wire. Quarantine it instead of risking a duplicate standalone send."""
         from gateway.config import Platform
         from concurrent.futures import Future
 
@@ -3290,11 +3569,13 @@ class TestDeliverResultTimeoutCancelsFuture:
                 "Hello world",
                 adapters={Platform.TELEGRAM: adapter},
                 loop=loop,
+                return_report=True,
             )
 
-        # A real exception must NOT be assume-delivered: standalone runs.
-        standalone_send.assert_awaited_once()
-        assert result is None, f"standalone should have delivered, got: {result!r}"
+        standalone_send.assert_not_awaited()
+        assert result.confirmed is False
+        assert result.ambiguous
+        assert "adapter exploded" in result.error
 
     def test_live_adapter_forum_topic_in_private_chat_routes_via_message_thread_id(self):
         """#52060: a cron target to a PRIVATE Telegram chat with a numeric topic
@@ -3920,8 +4201,8 @@ class TestDeliverOriginUnresolvableIsLocal:
 
 class TestSendMediaTimeoutCancelsFuture:
     """Same orphan-coroutine guarantee for _send_media_via_adapter's
-    future.result(timeout=30) call. If this times out mid-batch, the
-    in-flight coroutine must be cancelled before the next file is tried.
+    future.result(timeout=30) call. Cancellation is cleanup only; a timeout
+    remains ambiguous even when the Future accepts cancellation.
     """
 
     def test_media_send_timeout_cancels_future_and_continues(self, tmp_path, monkeypatch):
@@ -3975,10 +4256,13 @@ class TestSendMediaTimeoutCancelsFuture:
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
             # Should not raise — the except Exception clause swallows the timeout
-            _send_media_via_adapter(adapter, "chat-1", media_files, None, loop, job)
+            report = _send_media_via_adapter(
+                adapter, "chat-1", media_files, None, loop, job
+            )
 
         # 1. The timed-out future was cancelled (the bug fix)
         assert timeout_cancel_calls == [True], "future.cancel() must fire on TimeoutError"
+        assert any("outcome is unknown" in error for error in report.errors)
         # 2. Second file still got dispatched — one timeout doesn't abort the batch
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == str(fast.resolve())
@@ -4748,7 +5032,13 @@ class TestMultiTargetDeliveryContinuesOnFailure:
             fail_future.result.side_effect = ConnectionError("SMTP connection refused")
             ok_future = MagicMock()
             ok_future.result.return_value = {"success": True}
-            mock_pool.submit.side_effect = [fail_future, ok_future]
+            futures = iter([fail_future, ok_future])
+
+            def submit(_runner, coro):
+                coro.close()
+                return next(futures)
+
+            mock_pool.submit.side_effect = submit
 
             result = _deliver_result(job, "Report content")
 
@@ -4777,7 +5067,12 @@ class TestMultiTargetDeliveryContinuesOnFailure:
 
             fail_future = MagicMock()
             fail_future.result.side_effect = ConnectionError("connection refused")
-            mock_pool.submit.return_value = fail_future
+
+            def submit(_runner, coro):
+                coro.close()
+                return fail_future
+
+            mock_pool.submit.side_effect = submit
 
             result = _deliver_result(job, "Report content")
 

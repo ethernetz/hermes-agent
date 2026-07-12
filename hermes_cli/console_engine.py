@@ -1470,7 +1470,7 @@ def _enforce_hosted_line_policy(path: tuple[str, ...], args: Sequence[str]) -> N
         return
 
     if path in {("cron", "create"), ("cron", "edit")}:
-        for flag in ("--script", "--no-agent", "--workdir"):
+        for flag in ("--script", "--no-agent", "--workdir", "--delivery-confirmation"):
             if _flag_present(args, flag):
                 raise ConsoleCommandError(
                     f"`cron {' '.join(path[1:])} {flag}` is not available in "

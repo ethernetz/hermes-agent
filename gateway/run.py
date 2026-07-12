@@ -2782,6 +2782,25 @@ class _OutboundWriteaheadRecorder:
             handle.get("chat_id"), err_text,
         )
 
+    def mark_ambiguous(self, handle, error):
+        """Record that a send started but no authoritative ack arrived."""
+        if not handle:
+            return
+        from gateway.outbound_memory import DELIVERY_UNKNOWN_PREFIX
+        err_text = str(error or "unknown outcome")[:500]
+        self._runner.session_store.append_out_of_band(
+            handle.get("session_id"),
+            f"{DELIVERY_UNKNOWN_PREFIX} ({err_text}). "
+            "Do not assume the user received it, and do not resend it "
+            "without checking for a duplicate first.]",
+            timestamp=datetime.now().isoformat(),
+        )
+        logger.warning(
+            "outbound-memory: delivery recorded at row %s to %s:%s is AMBIGUOUS: %s",
+            handle.get("row_id"), handle.get("platform_name"),
+            handle.get("chat_id"), err_text,
+        )
+
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """

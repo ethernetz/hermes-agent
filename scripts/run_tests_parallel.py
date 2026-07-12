@@ -44,6 +44,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -253,21 +254,35 @@ def _run_one_file(
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     
     subproc_start = time.monotonic()
-    # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        # skipping writing bytecode because we're running a bunch of parallel python processes on the same code
-        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    # HERMES_HOME must be isolated BEFORE pytest imports test modules.  An
+    # autouse fixture is too late for modules such as cron.jobs that resolve
+    # profile paths at import time; without this guard collection itself can
+    # bind JOBS_FILE to the developer's live ~/.hermes/cron/jobs.json.
+    test_home = tempfile.TemporaryDirectory(prefix="hermes-test-file-")
+    child_env = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HERMES_HOME": test_home.name,
+        "HERMES_TESTING": "1",
+    }
+    try:
+        # launch the pytest process
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=child_env,
+            # POSIX: place the child at the head of its own process group so
+            # _kill_tree can SIGKILL the group atomically.
+            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+            # _kill_tree handles the Windows path via taskkill /F /T.
+            start_new_session=True,
+        )
+    except BaseException:
+        test_home.cleanup()
+        raise
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
@@ -298,6 +313,7 @@ def _run_one_file(
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
         _kill_tree(proc, pgid=pgid)
+        test_home.cleanup()
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
@@ -313,6 +329,7 @@ def _run_one_file(
         rc = 0
     summary = _parse_pytest_summary(output)
     subproc_wall = time.monotonic() - subproc_start
+    test_home.cleanup()
     return file, rc, output, summary, subproc_wall
 
 

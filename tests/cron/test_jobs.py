@@ -17,6 +17,7 @@ from cron.jobs import (
     pause_job,
     resume_job,
     remove_job,
+    mark_job_delivery,
     mark_job_run,
     advance_next_run,
     claim_dispatch,
@@ -543,6 +544,76 @@ class TestMarkJobRun:
         mark_job_run(job["id"], success=True, delivery_error=None)
         updated = get_job(job["id"])
         assert updated["last_delivery_error"] is None
+
+    def test_explicit_delivery_status_distinguishes_not_attempted_from_confirmed(
+        self, tmp_cron_dir
+    ):
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(
+            job["id"],
+            success=True,
+            delivery_status="not_attempted",
+        )
+        skipped = get_job(job["id"])
+        assert skipped["last_delivery_status"] == "not_attempted"
+        assert skipped.get("last_delivery_at") is None
+
+        mark_job_run(
+            job["id"],
+            success=True,
+            delivery_status="confirmed",
+        )
+        confirmed = get_job(job["id"])
+        assert confirmed["last_delivery_status"] == "confirmed"
+        assert confirmed.get("last_delivery_at")
+
+    def test_per_target_success_cannot_overwrite_partial_aggregate(
+        self, tmp_cron_dir
+    ):
+        job = create_job(prompt="Fan out", schedule="every 1h")
+        mark_job_run(
+            job["id"],
+            success=True,
+            delivery_status="partial",
+            delivery_error="one target is still pending",
+        )
+
+        # A later retry confirms one concrete target, but it cannot prove the
+        # other target resolved. Keep the complete run's aggregate status.
+        mark_job_delivery(job["id"], "confirmed")
+
+        updated = get_job(job["id"])
+        assert updated["last_delivery_status"] == "partial"
+        assert updated["last_delivery_error"] == "one target is still pending"
+
+    def test_per_target_updates_are_monotonic_until_next_complete_run(
+        self, tmp_cron_dir
+    ):
+        job = create_job(prompt="Fan out", schedule="every 1h")
+        mark_job_run(
+            job["id"],
+            success=True,
+            delivery_status="ambiguous",
+            delivery_error="one send may be on the wire",
+        )
+
+        mark_job_delivery(job["id"], "retry_wait", "another target will retry")
+        mark_job_delivery(job["id"], "confirmed")
+        unresolved = get_job(job["id"])
+        assert unresolved["last_delivery_status"] == "ambiguous"
+        assert unresolved["last_delivery_error"] == "one send may be on the wire"
+
+        # mark_job_run has whole-run visibility, so a later complete run may
+        # intentionally reset the conservative asynchronous status.
+        mark_job_run(
+            job["id"],
+            success=True,
+            delivery_status="confirmed",
+            delivery_error=None,
+        )
+        resolved = get_job(job["id"])
+        assert resolved["last_delivery_status"] == "confirmed"
+        assert resolved["last_delivery_error"] is None
 
     def test_both_agent_and_delivery_error(self, tmp_cron_dir):
         """Agent fails AND delivery fails — both errors recorded."""

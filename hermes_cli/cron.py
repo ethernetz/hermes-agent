@@ -291,6 +291,73 @@ def _print_active_jobs_summary(jobs) -> None:
         print("  No active jobs")
 
 
+def cron_delivery_status(as_json: bool = False) -> int:
+    """Show delivery health from platform receipts, never output inference."""
+    import json
+
+    from cron.delivery_outbox import health_snapshot
+
+    snapshot = health_snapshot()
+    if as_json:
+        print(json.dumps(snapshot, indent=2, default=str))
+        return 0 if snapshot["healthy"] else 1
+
+    status = "healthy" if snapshot["healthy"] else "attention required"
+    status_color = Colors.GREEN if snapshot["healthy"] else Colors.YELLOW
+    print(color(f"Cron delivery outbox: {status}", status_color))
+    counts = snapshot.get("counts") or {}
+    print("  " + (", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "empty"))
+    latest = snapshot.get("latest_confirmed")
+    if latest:
+        receipt = latest.get("receipt") or {}
+        print(
+            "  Latest confirmed: "
+            f"{latest.get('delivery_id')} ({receipt.get('confirmation') or 'adapter_ack'}, "
+            f"message_id={'yes' if receipt.get('message_id') else 'no'})"
+        )
+    for item in snapshot.get("unhealthy") or []:
+        print(
+            f"  ⚠ {item.get('state')}: {item.get('delivery_id')} "
+            f"job={item.get('job_id')} — {item.get('error') or 'reconciliation required'}"
+        )
+    return 0 if snapshot["healthy"] else 1
+
+
+def cron_delivery_quarantine(
+    delivery_id: str, reason: str, as_json: bool = False
+) -> int:
+    """Safely suppress retries for one receipt-free outbox delivery."""
+    from cron.delivery_outbox import quarantine
+
+    try:
+        result = quarantine(delivery_id, reason)
+    except ValueError as exc:
+        if as_json:
+            print(json.dumps({"success": False, "error": str(exc)}, indent=2))
+        else:
+            print(color(f"Failed to quarantine delivery: {exc}", Colors.RED))
+        return 1
+
+    record = result.record
+    payload = {
+        "success": True,
+        "changed": result.changed,
+        "delivery_id": record.delivery_id,
+        "state": record.state,
+        "quarantine_reason": record.quarantine_reason,
+        "quarantined_at": record.quarantined_at,
+        "receipt": record.receipt,
+    }
+    if as_json:
+        print(json.dumps(payload, indent=2, default=str))
+    else:
+        verb = "Quarantined" if result.changed else "Already quarantined"
+        print(color(f"{verb} delivery: {record.delivery_id}", Colors.GREEN))
+        print(f"  Reason: {record.quarantine_reason}")
+        print("  Receipt: none; source acknowledgement was not invoked")
+    return 0
+
+
 def cron_create(args):
     # The gateway-lifecycle guard lives in cron.jobs.create_job so it fires on
     # every job-creation path (this CLI subcommand AND the agent's `cronjob`
@@ -310,6 +377,7 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        delivery_confirmation=getattr(args, "delivery_confirmation", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -373,6 +441,7 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        delivery_confirmation=getattr(args, "delivery_confirmation", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -429,6 +498,16 @@ def cron_command(args):
         cron_status()
         return 0
 
+    if subcmd == "delivery-status":
+        return cron_delivery_status(getattr(args, "json", False))
+
+    if subcmd == "delivery-quarantine":
+        return cron_delivery_quarantine(
+            args.delivery_id,
+            args.reason,
+            getattr(args, "json", False),
+        )
+
     if subcmd == "tick":
         cron_tick()
         return 0
@@ -452,5 +531,8 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|tick]")
+    print(
+        "Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|"
+        "delivery-status|delivery-quarantine|tick]"
+    )
     sys.exit(1)

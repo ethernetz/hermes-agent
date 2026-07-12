@@ -20,11 +20,38 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
+
+# The canonical wrapper sets HERMES_HOME before this process starts.  Keep a
+# second guard for developers who invoke pytest directly: collection imports
+# modules before autouse fixtures run, and cron.jobs historically cached its
+# store path at import time.  Binding a temporary session home here makes a
+# direct pytest invocation safe as well.
+_DIRECT_TEST_HOME = None
+_configured_test_home = os.environ.get("HERMES_HOME")
+_live_hermes_root = (Path.home() / ".hermes").resolve()
+try:
+    _test_home_is_live = bool(_configured_test_home) and Path(
+        _configured_test_home
+    ).resolve().is_relative_to(_live_hermes_root)
+except (OSError, RuntimeError):
+    _test_home_is_live = True
+if (
+    os.environ.get("HERMES_TESTING") != "1"
+    or not _configured_test_home
+    or _test_home_is_live
+):
+    _DIRECT_TEST_HOME = tempfile.mkdtemp(prefix="hermes-direct-pytest-")
+    os.environ["HERMES_HOME"] = _DIRECT_TEST_HOME
+    os.environ["HERMES_TESTING"] = "1"
+    atexit.register(shutil.rmtree, _DIRECT_TEST_HOME, ignore_errors=True)
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -200,6 +227,13 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_EXEC_ASK",
     "HERMES_HOME_MODE",
     "HERMES_AGENT_USE_LEGACY_SESSION_KEYS",
+    "HERMES_DELIVERY_ACK_PROTOCOL",
+    "HERMES_DELIVERY_ID",
+    "HERMES_DELIVERY_PLATFORM",
+    "HERMES_DELIVERY_CHAT_ID",
+    "HERMES_DELIVERY_MESSAGE_ID",
+    "HERMES_DELIVERY_CONFIRMATION",
+    "HERMES_DELIVERY_CONFIRMATION_LEVEL",
     # Kanban path/board pins must never leak from a developer shell or
     # dispatched worker into tests; otherwise tests can write fake tasks to
     # the real ~/.hermes/kanban.db instead of the per-test HERMES_HOME.

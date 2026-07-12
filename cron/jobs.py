@@ -792,6 +792,17 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+def _normalize_delivery_confirmation(value: Any) -> Optional[str]:
+    if value in {None, ""}:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized not in {"adapter_ack", "message_id"}:
+        raise ValueError(
+            "delivery_confirmation must be 'adapter_ack' or 'message_id'"
+        )
+    return normalized
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -865,6 +876,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    delivery_confirmation: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -941,6 +953,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_confirmation = _normalize_delivery_confirmation(delivery_confirmation)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1022,6 +1035,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_confirmation is not None:
+        job["delivery_confirmation"] = normalized_confirmation
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1111,6 +1126,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "delivery_confirmation" in updates:
+                updates["delivery_confirmation"] = _normalize_delivery_confirmation(
+                    updates["delivery_confirmation"]
+                )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
@@ -1233,8 +1253,13 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    delivery_status: Optional[str] = None,
+):
     """
     Mark a job as having been run.
     
@@ -1243,6 +1268,9 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+    ``delivery_status`` lets the scheduler distinguish receipt-confirmed sends
+    from runs where delivery was intentionally/not-yet attempted. When omitted,
+    the historical error-based inference is preserved for external callers.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1254,6 +1282,20 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                if delivery_status is not None:
+                    job["last_delivery_status"] = str(delivery_status)
+                else:
+                    if delivery_error is None:
+                        job["last_delivery_status"] = "confirmed"
+                    elif any(
+                        marker in str(delivery_error).lower()
+                        for marker in ("unknown", "ambiguous", "after dispatch")
+                    ):
+                        job["last_delivery_status"] = "ambiguous"
+                    else:
+                        job["last_delivery_status"] = "pending"
+                if delivery_status == "confirmed":
+                    job["last_delivery_at"] = now
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -1321,6 +1363,65 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 return
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+
+
+def mark_job_delivery(
+    job_id: str,
+    status: str,
+    error: Optional[str] = None,
+) -> None:
+    """Conservatively update delivery state without re-running the job.
+
+    Outbox callbacks are per target, while ``last_delivery_status`` describes
+    the aggregate run.  Without a durable batch coordinator, a late success
+    for one target cannot prove that another target is no longer partial,
+    ambiguous, or dead.  These asynchronous updates are therefore monotonic:
+    they may make aggregate health worse, but never improve it.  A subsequent
+    complete run may reset the status through :func:`mark_job_run`, which has
+    visibility into every target from that run.
+    """
+    severity = {
+        "not_attempted": 0,
+        "confirmed": 0,
+        "pending": 1,
+        "retry_wait": 1,
+        "ack_pending": 1,
+        "ack_in_flight": 1,
+        "ack_retry": 1,
+        "partial": 2,
+        "dead": 3,
+        "ack_dead": 3,
+        "quarantined": 4,
+        "ambiguous": 4,
+    }
+    incoming = str(status)
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            current = str(job.get("last_delivery_status") or "")
+            current_severity = severity.get(current, -1)
+            incoming_severity = severity.get(incoming, current_severity)
+            if current and incoming_severity < current_severity:
+                logger.info(
+                    "Ignoring per-target delivery status improvement for job %s "
+                    "(%s -> %s); aggregate status requires a complete run",
+                    job_id,
+                    current,
+                    incoming,
+                )
+                return
+            job["last_delivery_status"] = incoming
+            # Never clear a useful aggregate error on a target-local callback
+            # unless the aggregate status is genuinely reset by mark_job_run.
+            if error is not None:
+                job["last_delivery_error"] = error
+            if incoming == "confirmed":
+                job["last_delivery_error"] = None
+                job["last_delivery_at"] = _hermes_now().isoformat()
+            save_jobs(jobs)
+            return
 
 
 def claim_dispatch(job_id: str) -> bool:

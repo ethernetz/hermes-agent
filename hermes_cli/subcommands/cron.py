@@ -70,6 +70,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )
+    cron_create.add_argument(
+        "--delivery-confirmation",
+        choices=("adapter_ack", "message_id"),
+        help=(
+            "Require an explicit adapter acknowledgement (default) or a "
+            "platform message ID before delivery is considered confirmed."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -134,6 +142,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
     )
+    cron_edit.add_argument(
+        "--delivery-confirmation",
+        choices=("adapter_ack", "message_id"),
+        help=(
+            "Require an explicit adapter acknowledgement or platform message "
+            "ID before delivery is considered confirmed."
+        ),
+    )
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
@@ -155,6 +171,28 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     # cron status
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
+
+    cron_deliveries = cron_subparsers.add_parser(
+        "delivery-status",
+        help="Show receipt-backed cron delivery outbox health",
+    )
+    cron_deliveries.add_argument(
+        "--json", action="store_true", help="Print the machine-readable snapshot"
+    )
+
+    cron_quarantine = cron_subparsers.add_parser(
+        "delivery-quarantine",
+        help="Terminally quarantine one unsent outbox delivery",
+    )
+    cron_quarantine.add_argument("delivery_id", help="Exact outbox delivery ID")
+    cron_quarantine.add_argument(
+        "--reason",
+        required=True,
+        help="Operator audit reason (required)",
+    )
+    cron_quarantine.add_argument(
+        "--json", action="store_true", help="Print the machine-readable result"
+    )
 
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
