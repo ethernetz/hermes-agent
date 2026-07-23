@@ -6,7 +6,7 @@ the relay provides it) on the MessageEvent, so the gateway can inject the
 via platform_message_id. Before 2026-07-06 the adapter dropped these fields
 at ingestion, so replying to a specific alert carried no referent at all.
 """
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -84,3 +84,35 @@ class TestReplyMetadataExtraction:
         event = await _inbound_event(adapter, _payload())
         assert event.reply_to_message_id is None
         assert event.reply_to_text is None
+
+
+class TestAttachmentCaching:
+    @pytest.mark.asyncio
+    async def test_remote_image_is_cached_before_gateway_ingestion(self):
+        adapter = _make_adapter()
+        payload = _payload(
+            text="please inspect this",
+            attachments=[
+                {
+                    "url": "https://cdn.example.invalid/screenshot.png?token=secret",
+                    "mimeType": "image/png",
+                    "filename": "screenshot.png",
+                }
+            ],
+        )
+
+        with patch.object(
+            adapter_mod,
+            "cache_image_from_url",
+            AsyncMock(return_value="/tmp/hermes-image-cache/screenshot.png"),
+        ) as cache:
+            event = await _inbound_event(adapter, payload)
+
+        cache.assert_awaited_once_with(
+            "https://cdn.example.invalid/screenshot.png?token=secret",
+            ext=".png",
+        )
+        assert event.media_urls == ["/tmp/hermes-image-cache/screenshot.png"]
+        assert event.media_types == ["image/png"]
+        assert event.message_type == adapter_mod.MessageType.PHOTO
+        assert "token=secret" not in event.text

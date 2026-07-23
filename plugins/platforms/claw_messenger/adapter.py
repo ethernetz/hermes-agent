@@ -31,7 +31,14 @@ except Exception:  # pragma: no cover - handled by check_requirements
     websockets = None
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    cache_image_from_url,
+    safe_url_for_log,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +148,23 @@ def _looks_like_image(value: str) -> bool:
     return lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".heif"))
 
 
+def _image_extension(name_or_url: str, mime_type: str) -> str:
+    mime = str(mime_type or "").lower().split(";", 1)[0]
+    by_mime = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }
+    if mime in by_mime:
+        return by_mime[mime]
+    path = urlsplit(str(name_or_url or "")).path.lower()
+    for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        if path.endswith(ext):
+            return ext
+    return ".jpg"
+
+
 def _attachment_media_fields(attachments: Any) -> tuple[list[str], list[str], list[str]]:
     media_urls: list[str] = []
     media_types: list[str] = []
@@ -189,7 +213,10 @@ def _attachment_media_fields(attachments: Any) -> tuple[list[str], list[str], li
         if mime:
             bits.append(mime)
         if url and str(url) != name:
-            bits.append(str(url))
+            display_url = str(url)
+            if display_url.lower().startswith(("http://", "https://")):
+                display_url = safe_url_for_log(display_url)
+            bits.append(display_url)
         summaries.append(" (" + "; ".join(bits) + ")" if bits else "(attachment)")
 
     return media_urls, media_types, summaries
@@ -482,6 +509,26 @@ class ClawMessengerAdapter(BasePlatformAdapter):
             )
 
         media_urls, media_types, attachment_summaries = _attachment_media_fields(attachments)
+        for index, media_url in enumerate(media_urls):
+            mime = media_types[index] if index < len(media_types) else ""
+            if not str(media_url).lower().startswith(("http://", "https://")):
+                continue
+            if not (mime.startswith("image/") or _looks_like_image(media_url)):
+                continue
+            try:
+                cached_path = await cache_image_from_url(
+                    media_url,
+                    ext=_image_extension(media_url, mime),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[claw_messenger] could not cache inbound image %s: %s",
+                    urlsplit(media_url).netloc or "<unknown host>",
+                    exc,
+                )
+            else:
+                media_urls[index] = cached_path
+                logger.info("[claw_messenger] cached inbound image attachment")
         if attachments:
             keys = sorted({k for att in attachments if isinstance(att, dict) for k in att.keys()})
             logger.info("[claw_messenger] inbound attachment metadata: count=%d keys=%s", len(attachments), keys)
